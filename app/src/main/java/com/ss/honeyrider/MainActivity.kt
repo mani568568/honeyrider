@@ -9,6 +9,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
@@ -222,7 +223,7 @@ object FakeRepository {
 // 2. VIEWMODELS
 // ================================================================================
 
-enum class ProcessedOrderFilter { ACCEPTED, COMPLETED }
+enum class ProcessedOrderFilter { ALL, ACCEPTED, COMPLETED, REJECTED }
 
 class RiderViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = FakeRepository
@@ -234,7 +235,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiEvent = MutableSharedFlow<UiEvent>()
     val uiEvent = _uiEvent.asSharedFlow()
 
-    private val _processedOrderFilter = MutableStateFlow(ProcessedOrderFilter.ACCEPTED)
+    private val _processedOrderFilter = MutableStateFlow(ProcessedOrderFilter.ALL)
     val processedOrderFilter = _processedOrderFilter.asStateFlow()
 
     val pendingOrders = repository.orders.map { orders ->
@@ -242,12 +243,17 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val processedOrders = combine(repository.orders, _processedOrderFilter) { orders, filter ->
-        orders.filter { it.status.name == filter.name }
+        val filteredList = when (filter) {
+            ProcessedOrderFilter.ALL -> orders.filter { it.status != OrderStatus.PENDING }
+            else -> orders.filter { it.status.name == filter.name }
+        }
+        // Sort by the latest available timestamp, descending (newest first)
+        filteredList.sortedByDescending { it.completionTimestamp ?: it.acceptedTimestamp ?: 0L }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
 
     // Updated default BalanceSheet value
-    val balanceSheet = repository.balance.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), BalanceSheet(0.0))
+    val balanceSheet = repository.balance.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), BalanceSheet(tips = 0.0))
 
 
     init {
@@ -347,7 +353,8 @@ private val DarkGray = Color(0xFF424242)
 private val SurfaceGrey = Color(0xFFF5F5F5)
 private val LightGray = Color(0xFFBDBDBD)
 private val GreenAccept = Color(0xFF4CAF50)
-private val PurpleAccept = Color(0xFF673AB7) // Color for Accept button
+private val PurpleAccept = Color(0xFF673AB7)
+private val OrangeAccepted = Color(0xFFFFA726) // Orange for accepted orders
 
 private val AppColorScheme = lightColorScheme(
     primary = PrimaryRed,
@@ -402,7 +409,7 @@ fun MainScreen(riderViewModel: RiderViewModel) {
 
     Scaffold(
         bottomBar = {
-            AnimatedVisibility(visible = shouldShowBottomBar) {
+            if (shouldShowBottomBar) {
                 AppBottomNavigation(navController = navController)
             }
         }
@@ -481,17 +488,19 @@ fun AppBottomNavigation(navController: NavController) {
 // --- Login Screen ---
 @Composable
 fun LoginScreen(navController: NavController) {
-    var username by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    val context = LocalContext.current
-
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
+            .padding(24.dp)
+            .statusBarsPadding()
+            .navigationBarsPadding(),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
+        var username by remember { mutableStateOf("") }
+        var password by remember { mutableStateOf("") }
+        val context = LocalContext.current
+
         Icon(Icons.Default.TwoWheeler, "Rider Icon", modifier = Modifier.size(80.dp), tint = PrimaryRed)
         Spacer(Modifier.height(16.dp))
         Text("Rider Login", style = MaterialTheme.typography.headlineMedium)
@@ -537,27 +546,32 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
-        profile?.let {
-            HomeTopBar(
-                profile = it,
-                onStatusChangeClick = { viewModel.toggleAvailability() },
-                onProfileClick = { navController.navigate(AppRoutes.PROFILE) }
-            )
+    // Scaffold now manages the top padding via its topBar
+    Scaffold(
+        topBar = {
+            profile?.let {
+                HomeTopBar(
+                    profile = it,
+                    onStatusChangeClick = { viewModel.toggleAvailability() },
+                    onProfileClick = { navController.navigate(AppRoutes.PROFILE) }
+                )
+            }
         }
-
-        if (profile?.isAvailable == false) {
-            EmptyState(message = "You are currently offline. Go online to receive new order requests.")
-        } else if (pendingOrders.isEmpty()) {
-            EmptyState(message = "No new orders right now. We'll notify you!")
-        } else {
-            LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                items(pendingOrders) { order ->
-                    OrderRequestCard(
-                        order = order,
-                        onAccept = { viewModel.acceptOrder(order.id) },
-                        onDeny = { viewModel.abortOrder(order.id) }
-                    )
+    ) { padding ->
+        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+            if (profile?.isAvailable == false) {
+                EmptyState(message = "You are currently offline. Go online to receive new order requests.")
+            } else if (pendingOrders.isEmpty()) {
+                EmptyState(message = "No new orders right now. We'll notify you!")
+            } else {
+                LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    items(pendingOrders) { order ->
+                        OrderRequestCard(
+                            order = order,
+                            onAccept = { viewModel.acceptOrder(order.id) },
+                            onDeny = { viewModel.abortOrder(order.id) }
+                        )
+                    }
                 }
             }
         }
@@ -599,7 +613,7 @@ fun OrdersScreen(viewModel: RiderViewModel) {
             onSubmit = { collectedAmount ->
                 val order = orderForCollection!!
                 val change = collectedAmount - order.cashToCollect
-                val tip = if (change > 0) change else 0.0 // Any extra amount is considered a tip
+                val tip = if (change > 0) change else 0.0
                 viewModel.completeOrder(order.id, tip)
                 orderForCollection = null
             }
@@ -609,13 +623,15 @@ fun OrdersScreen(viewModel: RiderViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Order History & Tips") }, // UPDATED TITLE
+                title = { Text("Order History & Tips") },
                 actions = {
                     Box {
                         IconButton(onClick = { showFilterMenu = true }) { Icon(Icons.Default.FilterList, contentDescription = "Filter Orders") }
                         DropdownMenu(expanded = showFilterMenu, onDismissRequest = { showFilterMenu = false }) {
+                            DropdownMenuItem(text = { Text("All") }, onClick = { viewModel.setProcessedOrderFilter(ProcessedOrderFilter.ALL); showFilterMenu = false })
                             DropdownMenuItem(text = { Text("Accepted") }, onClick = { viewModel.setProcessedOrderFilter(ProcessedOrderFilter.ACCEPTED); showFilterMenu = false })
                             DropdownMenuItem(text = { Text("Completed") }, onClick = { viewModel.setProcessedOrderFilter(ProcessedOrderFilter.COMPLETED); showFilterMenu = false })
+                            DropdownMenuItem(text = { Text("Aborted") }, onClick = { viewModel.setProcessedOrderFilter(ProcessedOrderFilter.REJECTED); showFilterMenu = false })
                         }
                     }
                 }
@@ -624,7 +640,14 @@ fun OrdersScreen(viewModel: RiderViewModel) {
     ) { padding ->
         LazyColumn(modifier = Modifier.padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { BalanceSheetCard(balance = balanceSheet) }
-            item { Text("Orders (${selectedFilter.name.lowercase().replaceFirstChar { it.titlecase() }})", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp)) }
+            item {
+                val filterText = when (selectedFilter) {
+                    ProcessedOrderFilter.ALL -> "All"
+                    ProcessedOrderFilter.REJECTED -> "Aborted"
+                    else -> selectedFilter.name.lowercase().replaceFirstChar { it.titlecase() }
+                }
+                Text("Orders ($filterText)", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp))
+            }
 
             if (processedOrders.isEmpty()) {
                 item { EmptyState(message = "No orders found for this filter.") }
@@ -707,9 +730,8 @@ fun AmountCollectionDialog(order: Order, onDismiss: () -> Unit, onSubmit: (Doubl
 fun BalanceSheetCard(balance: BalanceSheet) {
     Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(4.dp)) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Your Tips", style = MaterialTheme.typography.headlineSmall) // UPDATED TITLE
+            Text("Your Tips", style = MaterialTheme.typography.headlineSmall)
             Divider()
-            // BalanceRow("Total Earnings", balance.totalEarnings) // REMOVED
             BalanceRow("Tips Collected", balance.tips)
         }
     }
@@ -728,7 +750,17 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
     var isExpanded by remember { mutableStateOf(false) }
     val rotationAngle by animateFloatAsState(targetValue = if (isExpanded) 180f else 0f, label = "expansion_arrow")
 
-    Card(modifier = Modifier.fillMaxWidth().clickable { isExpanded = !isExpanded }, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+    val cardColors = when (order.status) {
+        OrderStatus.COMPLETED -> CardDefaults.cardColors(containerColor = GreenAccept, contentColor = Color.White)
+        OrderStatus.ACCEPTED -> CardDefaults.cardColors(containerColor = OrangeAccepted, contentColor = DarkGray)
+        OrderStatus.REJECTED -> CardDefaults.cardColors(containerColor = PrimaryRed, contentColor = Color.White)
+        else -> CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable { isExpanded = !isExpanded },
+        colors = cardColors
+    ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(modifier = Modifier.weight(1f)) {
@@ -741,7 +773,7 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                     val timeTaken = order.completionTimestamp - order.acceptedTimestamp
                     val minutes = TimeUnit.MILLISECONDS.toMinutes(timeTaken)
                     val seconds = TimeUnit.MILLISECONDS.toSeconds(timeTaken) % 60
-                    Text(text = "Took ${minutes}m ${seconds}s", style = MaterialTheme.typography.bodySmall, color = DarkGray, modifier = Modifier.padding(horizontal = 8.dp))
+                    Text(text = "Took ${minutes}m ${seconds}s", style = MaterialTheme.typography.bodySmall, color = LocalContentColor.current.copy(alpha = 0.8f), modifier = Modifier.padding(horizontal = 8.dp))
                 }
                 OrderStatusChip(status = order.status)
                 Icon(imageVector = Icons.Default.KeyboardArrowDown, contentDescription = "Expand", modifier = Modifier.rotate(rotationAngle))
@@ -749,21 +781,20 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
 
             AnimatedVisibility(visible = isExpanded) {
                 Column(modifier = Modifier.padding(top = 16.dp)) {
-                    Divider()
+                    Divider(color = LocalContentColor.current.copy(alpha = 0.3f))
                     Spacer(Modifier.height(12.dp))
                     OrderDetailRow(icon = Icons.Default.Store, label = "Pickup", value = order.pickupAddress)
                     OrderDetailRow(icon = Icons.Default.Home, label = "Delivery", value = order.deliveryAddress)
                     OrderDetailRow(icon = Icons.Default.ShoppingBag, label = "Items", value = "${order.itemCount} Items")
-                    Divider(modifier = Modifier.padding(vertical = 12.dp))
+                    Divider(modifier = Modifier.padding(vertical = 12.dp), color = LocalContentColor.current.copy(alpha = 0.3f))
                     OrderDetailRow(icon = Icons.Default.Receipt, label = "Order Total", value = "₹%.2f".format(order.orderTotal))
                     OrderDetailRow(icon = Icons.Default.TwoWheeler, label = "Delivery Charge", value = "₹%.2f".format(order.deliveryCharge))
                     OrderDetailRow(icon = Icons.Default.FlashOn, label = "Surge Charge", value = "₹%.2f".format(order.surgeCharge))
                     OrderDetailRow(icon = Icons.Default.Payments, label = "Amount to Collect", value = "₹%.2f".format(order.cashToCollect), isHighlight = true)
-                    Divider(modifier = Modifier.padding(vertical = 12.dp))
+                    Divider(modifier = Modifier.padding(vertical = 12.dp), color = LocalContentColor.current.copy(alpha = 0.3f))
                     if (order.tipAmount > 0) {
                         OrderDetailRow(icon = Icons.Default.Favorite, label = "Tip Received", value = "₹%.2f".format(order.tipAmount))
                     }
-                    // OrderDetailRow for "Your Earnings" has been removed
                 }
             }
 
@@ -771,7 +802,7 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                 Spacer(Modifier.height(16.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = onAbortOrder, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.errorContainer)) { Text("Abort Order") }
-                    Button(onClick = onEndOrder, modifier = Modifier.weight(1f)) { Text("End Order") }
+                    Button(onClick = onEndOrder, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary)) { Text("End Order") }
                 }
             }
         }
@@ -799,7 +830,7 @@ fun OrderTimer(acceptedTimestamp: Long?, timeLimitMinutes: Int) {
     val seconds = TimeUnit.MILLISECONDS.toSeconds(absRemainingTime) % 60
 
     val timeString = String.format("%s%02d:%02d", if (isOvertime) "-" else "", minutes, seconds)
-    val color = if (isOvertime) PrimaryRed else GreenAccept
+    val color = if (isOvertime) PrimaryRed else if (LocalContentColor.current == Color.White) Color.White else GreenAccept
 
     Text(text = timeString, color = color, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp))
 }
@@ -807,12 +838,13 @@ fun OrderTimer(acceptedTimestamp: Long?, timeLimitMinutes: Int) {
 
 @Composable
 fun OrderDetailRow(icon: ImageVector, label: String, value: String, isHighlight: Boolean = false) {
+    val contentColor = LocalContentColor.current
     Row(modifier = Modifier.padding(vertical = 4.dp), verticalAlignment = Alignment.Top) {
-        Icon(imageVector = icon, contentDescription = label, modifier = Modifier.size(20.dp), tint = if (isHighlight) PrimaryRed else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+        Icon(imageVector = icon, contentDescription = label, modifier = Modifier.size(20.dp), tint = if (isHighlight) PrimaryRed else contentColor.copy(alpha = 0.7f))
         Spacer(Modifier.width(16.dp))
         Column {
-            Text(label, style = MaterialTheme.typography.labelMedium, color = Color.Gray)
-            Text(text = value, style = MaterialTheme.typography.bodyLarge, fontWeight = if (isHighlight) FontWeight.Bold else FontWeight.Normal, color = if (isHighlight) PrimaryRed else MaterialTheme.colorScheme.onSurface)
+            Text(label, style = MaterialTheme.typography.labelMedium, color = contentColor.copy(alpha = 0.7f))
+            Text(text = value, style = MaterialTheme.typography.bodyLarge, fontWeight = if (isHighlight) FontWeight.Bold else FontWeight.Normal, color = if (isHighlight) PrimaryRed else contentColor)
         }
     }
 }
@@ -820,19 +852,26 @@ fun OrderDetailRow(icon: ImageVector, label: String, value: String, isHighlight:
 
 @Composable
 fun OrderStatusChip(status: OrderStatus) {
-    val (text, color) = when (status) {
-        OrderStatus.ACCEPTED -> "Accepted" to GreenAccept
-        OrderStatus.REJECTED -> "Rejected" to PrimaryRed
+    val (text, bgColor) = when (status) {
+        OrderStatus.ACCEPTED -> "Accepted" to DarkGray
+        OrderStatus.REJECTED -> "Aborted" to PrimaryRed
         OrderStatus.COMPLETED -> "Completed" to DarkGray
         else -> status.name to LightGray
     }
-    Text(text = text, color = Color.White, modifier = Modifier.background(color, RoundedCornerShape(50)).padding(horizontal = 12.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium)
+    Text(text = text, color = Color.White, modifier = Modifier.background(bgColor, RoundedCornerShape(50)).padding(horizontal = 12.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium)
 }
 
 
 @Composable
 fun HomeTopBar(profile: RiderProfile, onStatusChangeClick: () -> Unit, onProfileClick: () -> Unit) {
-    Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(text = "Welcome, ${profile.name}!", style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(text = profile.vehicleNumber, style = MaterialTheme.typography.bodyMedium, color = LightGray)
@@ -869,9 +908,6 @@ fun OrderRequestCard(order: Order, onAccept: () -> Unit, onDeny: () -> Unit) {
                 InfoColumn("Drop", order.deliveryAddress, alignEnd = true)
             }
             Divider(modifier = Modifier.padding(vertical = 12.dp))
-
-            // The "Earnings" Row has been removed from here.
-
             Spacer(Modifier.height(16.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 Button(
@@ -984,6 +1020,7 @@ fun ProfileInfoRow(icon: androidx.compose.ui.graphics.vector.ImageVector, label:
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge() // Enables drawing behind system bars
         setContent {
             HoneyRiderTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
