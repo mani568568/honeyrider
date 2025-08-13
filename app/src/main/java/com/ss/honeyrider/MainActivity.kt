@@ -347,6 +347,7 @@ private val DarkGray = Color(0xFF424242)
 private val SurfaceGrey = Color(0xFFF5F5F5)
 private val LightGray = Color(0xFFBDBDBD)
 private val GreenAccept = Color(0xFF4CAF50)
+private val PurpleAccept = Color(0xFF673AB7) // Color for Accept button
 
 private val AppColorScheme = lightColorScheme(
     primary = PrimaryRed,
@@ -595,11 +596,11 @@ fun OrdersScreen(viewModel: RiderViewModel) {
         AmountCollectionDialog(
             order = orderForCollection!!,
             onDismiss = { orderForCollection = null },
-            onSubmit = { collectedAmount, addChangeAsTip ->
+            onSubmit = { collectedAmount ->
                 val order = orderForCollection!!
                 val change = collectedAmount - order.cashToCollect
-                val tipFromChange = if (addChangeAsTip && change > 0) change else 0.0
-                viewModel.completeOrder(order.id, tipFromChange)
+                val tip = if (change > 0) change else 0.0 // Any extra amount is considered a tip
+                viewModel.completeOrder(order.id, tip)
                 orderForCollection = null
             }
         )
@@ -658,9 +659,8 @@ fun ConfirmationDialog(action: String, onConfirm: () -> Unit, onDismiss: () -> U
 }
 
 @Composable
-fun AmountCollectionDialog(order: Order, onDismiss: () -> Unit, onSubmit: (Double, Boolean) -> Unit) {
+fun AmountCollectionDialog(order: Order, onDismiss: () -> Unit, onSubmit: (Double) -> Unit) {
     var amountText by remember { mutableStateOf("") }
-    var addChangeAsTip by remember { mutableStateOf(false) }
 
     val collectedAmount = amountText.toDoubleOrNull() ?: 0.0
     val isAmountSufficient = collectedAmount >= order.cashToCollect
@@ -684,16 +684,17 @@ fun AmountCollectionDialog(order: Order, onDismiss: () -> Unit, onSubmit: (Doubl
                 }
                 if (isAmountSufficient && change > 0) {
                     Text("Change to give back: ₹%.2f".format(change), color = GreenAccept)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(checked = addChangeAsTip, onCheckedChange = { addChangeAsTip = it })
-                        Text("Add change as tip")
-                    }
+                    Text(
+                        "Note: Extra amount of ₹%.2f will be added as a tip.".format(change),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray
+                    )
                 }
             }
         },
         confirmButton = {
             Button(
-                onClick = { onSubmit(collectedAmount, addChangeAsTip) },
+                onClick = { onSubmit(collectedAmount) },
                 enabled = isAmountSufficient
             ) { Text("Submit") }
         },
@@ -873,8 +874,16 @@ fun OrderRequestCard(order: Order, onAccept: () -> Unit, onDeny: () -> Unit) {
 
             Spacer(Modifier.height(16.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                Button(onClick = onDeny, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) { Text("Deny") }
-                Button(onClick = onAccept, modifier = Modifier.weight(1f)) { Text("Accept") }
+                Button(
+                    onClick = onDeny,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryRed)
+                ) { Text("Deny") }
+                Button(
+                    onClick = onAccept,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = PurpleAccept)
+                ) { Text("Accept") }
             }
         }
     }
