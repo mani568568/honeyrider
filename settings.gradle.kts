@@ -1,16 +1,12 @@
 pluginManagement {
     repositories {
-        google {
-            content {
-                includeGroupByRegex("com\\.android.*")
-                includeGroupByRegex("com\\.google.*")
-                includeGroupByRegex("androidx.*")
-            }
-        }
+        google()
         mavenCentral()
-        gradlePluginPortal()
+        gradlePluginPortal() // This is where the Compose Compiler plugin is hosted
     }
 }
+
+// Keep the rest of your settings file as it is
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
@@ -19,6 +15,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "HoneyRider"
+rootProject.name = "HoneyRider" // Or your project name
 include(":app")
- 

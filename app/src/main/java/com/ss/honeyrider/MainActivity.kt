@@ -1,32 +1,21 @@
 package com.ss.honeyrider
 
-import com.google.gson.Gson
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.MultipartBody
-import okhttp3.RequestBody.Companion.asRequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.File
-import okhttp3.RequestBody
-import okhttp3.Interceptor
-import okhttp3.Response
-import okhttp3.OkHttpClient
-import okhttp3.logging.HttpLoggingInterceptor
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
-import retrofit2.http.*
+import android.Manifest
 import android.app.Application
+import android.app.Service
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.IBinder
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
@@ -59,11 +48,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.ActivityCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
@@ -71,15 +60,35 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import coil.compose.AsyncImage
+import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName // <-- IMPORT THIS
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.logging.HttpLoggingInterceptor
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.*
+import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
+// region Network Layer
 data class LoginRequest(val username: String, val password: String)
 data class LoginResponse(val token: String, val id: Long)
 data class AvailabilityRequest(val isAvailable: Boolean)
+data class LocationUpdateRequest(val latitude: Double, val longitude: Double)
 
 class AuthInterceptor(private val context: Context) : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
@@ -91,6 +100,50 @@ class AuthInterceptor(private val context: Context) : Interceptor {
     }
 }
 
+interface ApiService {
+    @POST("api/auth/rider/login")
+    suspend fun login(@Body request: LoginRequest): LoginResponse
+
+    @GET("api/riders/profile")
+    suspend fun getRiderProfile(): RiderProfile
+
+    @PUT("api/riders/status")
+    suspend fun updateRiderStatus(@Body isAvailable: AvailabilityRequest): RiderProfile
+
+    @PUT("api/riders/location")
+    suspend fun updateRiderLocation(@Body location: LocationUpdateRequest)
+
+    @Multipart
+    @PUT("api/riders/profile")
+    suspend fun updateRiderProfile(
+        @Part("profile") profile: okhttp3.RequestBody,
+        @Part image: MultipartBody.Part?
+    ): RiderProfile
+}
+
+object RetrofitInstance {
+    private const val BASE_URL = "http://192.168.31.242:8080/"
+
+    fun create(context: Context): ApiService {
+        val logging = HttpLoggingInterceptor().apply {
+            level = HttpLoggingInterceptor.Level.BODY
+        }
+        val client = OkHttpClient.Builder()
+            .addInterceptor(AuthInterceptor(context))
+            .addInterceptor(logging)
+            .build()
+
+        return Retrofit.Builder()
+            .baseUrl(BASE_URL)
+            .client(client)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(ApiService::class.java)
+    }
+}
+// endregion
+
+// region Data Layer
 data class RiderProfile(
     val id: Long,
     val username: String,
@@ -99,6 +152,8 @@ data class RiderProfile(
     val vehicleNumber: String,
     val drivingLicense: String,
     val imageUrl: String?,
+    // This annotation tells Gson to map the "available" JSON field to this property.
+    @SerializedName("available")
     val isAvailable: Boolean
 )
 
@@ -121,10 +176,7 @@ data class Order(
         get() = orderTotal + deliveryCharge + surgeCharge
 }
 
-
-data class BalanceSheet(
-    val tips: Double
-)
+data class BalanceSheet(val tips: Double)
 
 enum class OrderStatus {
     PENDING, ACCEPTED, REJECTED, COMPLETED
@@ -160,29 +212,9 @@ object SessionManager {
     }
 }
 
-interface ApiService {
-    @POST("api/auth/rider/login")
-    suspend fun login(@Body request: LoginRequest): LoginResponse
-
-    @GET("api/riders/profile")
-    suspend fun getRiderProfile(): RiderProfile
-
-    @PUT("api/riders/status")
-    suspend fun updateRiderStatus(@Body isAvailable: AvailabilityRequest): RiderProfile
-
-    @Multipart
-    @PUT("api/riders/profile")
-    suspend fun updateRiderProfile(
-        @Part("profile") profile: RequestBody,
-        @Part image: MultipartBody.Part?
-    ): RiderProfile
-
-    // You can add Order-related API calls here later
-}
-
 class RiderRepository(private val apiService: ApiService, private val context: Context) {
 
-    suspend fun login(username: String, password: String):Result<LoginResponse> {
+    suspend fun login(username: String, password: String): Result<LoginResponse> {
         return try {
             val response = apiService.login(LoginRequest(username, password))
             Result.success(response)
@@ -204,6 +236,14 @@ class RiderRepository(private val apiService: ApiService, private val context: C
             Result.success(apiService.updateRiderStatus(AvailabilityRequest(isAvailable)))
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+
+    suspend fun updateRiderLocation(latitude: Double, longitude: Double) {
+        try {
+            apiService.updateRiderLocation(LocationUpdateRequest(latitude, longitude))
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
@@ -236,122 +276,45 @@ class RiderRepository(private val apiService: ApiService, private val context: C
             Result.failure(e)
         }
     }
-
-    // You can implement network calls for fetching and updating orders here
 }
+// endregion
 
-object RetrofitInstance {
+//region Service
+class LocationService : Service() {
 
-    private const val BASE_URL = "http://192.168.31.242:8080/" // URL for Android emulator to connect to localhost
+    private val serviceJob = SupervisorJob()
+    private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
-    fun create(context: Context): ApiService {
-        val logging = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BODY
-        }
-
-        val client = OkHttpClient.Builder()
-            .addInterceptor(AuthInterceptor(context))
-            .addInterceptor(logging)
-            .build()
-
-        return Retrofit.Builder()
-            .baseUrl(BASE_URL)
-            .client(client)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(ApiService::class.java)
-    }
-}
-
-
-object FakeRepository {
-    private val sampleOrders = MutableStateFlow(listOf(
-        Order("ORD-101", "Pizza Junction", "123 MG Road, Koramangala", "456 Indiranagar, 5th Main", OrderStatus.PENDING, 0.0, 3, 5, orderTotal = 750.0, deliveryCharge = 40.0, surgeCharge = 10.0)
-    ))
-
-    private val sampleRiders = mutableMapOf(
-        1L to RiderProfile(1L, "rider_one", "Suresh Kumar", "Honda Activa", "AP 39 AB 1234", "AP0120240012345", null, true)
-    )
-
-    private val balanceSheet = MutableStateFlow(BalanceSheet(tips = 0.0))
-
-
-    val orders: StateFlow<List<Order>> = sampleOrders.asStateFlow()
-    val balance: StateFlow<BalanceSheet> = balanceSheet.asStateFlow()
-
-    fun getRiderProfile(riderId: Long): Flow<RiderProfile?> {
-        return flowOf(sampleRiders[riderId])
+    companion object {
+        const val ACTION_START = "com.ss.honeyrider.ACTION_START"
+        const val ACTION_STOP = "com.ss.honeyrider.ACTION_STOP"
     }
 
-    suspend fun updateRiderStatus(riderId: Long, isAvailable: Boolean) {
-        delay(300)
-        sampleRiders[riderId]?.let {
-            sampleRiders[riderId] = it.copy(isAvailable = isAvailable)
-        }
-    }
-
-    suspend fun updateRiderProfile(riderId: Long, name: String, vehicleModel: String, vehicleNumber: String, drivingLicense: String, imageUri: Uri?): Result<Unit> {
-        delay(1000)
-        val currentProfile = sampleRiders[riderId]
-        if (currentProfile != null) {
-            sampleRiders[riderId] = currentProfile.copy(
-                name = name,
-                vehicleModel = vehicleModel,
-                vehicleNumber = vehicleNumber,
-                drivingLicense = drivingLicense,
-                imageUrl = imageUri?.toString() ?: currentProfile.imageUrl
-            )
-            return Result.success(Unit)
-        }
-        return Result.failure(Exception("Rider not found"))
-    }
-
-    suspend fun acceptOrder(orderId: String) {
-        sampleOrders.update { currentOrders ->
-            currentOrders.map {
-                if (it.id == orderId) {
-                    it.copy(status = OrderStatus.ACCEPTED, acceptedTimestamp = System.currentTimeMillis())
-                } else it
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> {
+                println("Location service started")
+            }
+            ACTION_STOP -> {
+                println("Location service stopped")
+                stopSelf()
             }
         }
+        return START_NOT_STICKY
     }
 
-    suspend fun completeOrder(orderId: String, additionalTip: Double) {
-        val order = sampleOrders.value.find { it.id == orderId }
-        if (order != null) {
-            balanceSheet.update {
-                it.copy(
-                    tips = it.tips + additionalTip
-                )
-            }
-            sampleOrders.update { currentOrders ->
-                currentOrders.map {
-                    if (it.id == orderId) {
-                        it.copy(
-                            status = OrderStatus.COMPLETED,
-                            completionTimestamp = System.currentTimeMillis(),
-                            tipAmount = additionalTip
-                        )
-                    } else it
-                }
-            }
-        }
+    override fun onDestroy() {
+        super.onDestroy()
+        serviceJob.cancel()
     }
 
-    suspend fun abortOrder(orderId: String) {
-        updateOrderStatus(orderId, OrderStatus.REJECTED)
-    }
-
-    private fun updateOrderStatus(orderId: String, newStatus: OrderStatus) {
-        sampleOrders.update { currentOrders ->
-            currentOrders.map {
-                if (it.id == orderId) it.copy(status = newStatus, completionTimestamp = System.currentTimeMillis()) else it
-            }
-        }
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
     }
 }
+//endregion
 
-
+// region ViewModel
 enum class ProcessedOrderFilter { ALL, ACCEPTED, COMPLETED, REJECTED }
 
 class RiderViewModel(application: Application) : AndroidViewModel(application) {
@@ -375,7 +338,6 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     ))
     val allOrders: StateFlow<List<Order>> = _allOrders.asStateFlow()
 
-
     val pendingOrders = _allOrders.map { orders ->
         orders.filter { it.status == OrderStatus.PENDING }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -387,7 +349,6 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         }
         filteredList.sortedByDescending { it.completionTimestamp ?: it.acceptedTimestamp ?: 0L }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
 
     val balanceSheet = MutableStateFlow(BalanceSheet(tips = 0.0))
 
@@ -431,14 +392,32 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleAvailability() {
+        val currentProfile = _profileState.value ?: return
+        val oldStatus = currentProfile.isAvailable
+        val newStatus = !oldStatus
+
+        _profileState.value = currentProfile.copy(isAvailable = newStatus)
+
         viewModelScope.launch {
-            val currentStatus = _profileState.value?.isAvailable ?: return@launch
-            val result = repository.updateRiderStatus(!currentStatus)
-            result.onSuccess { updatedProfile ->
-                _profileState.value = updatedProfile
-                _uiEvent.emit(UiEvent.ShowToast(if (updatedProfile.isAvailable) "You are now online!" else "You are now offline."))
+            val result = repository.updateRiderStatus(newStatus)
+            result.onSuccess { updatedProfileFromServer ->
+                _profileState.value = updatedProfileFromServer
+                if (updatedProfileFromServer.isAvailable) {
+                    Intent(getApplication(), LocationService::class.java).also {
+                        it.action = LocationService.ACTION_START
+                        getApplication<Application>().startService(it)
+                    }
+                    _uiEvent.emit(UiEvent.ShowToast("You are now online!"))
+                } else {
+                    Intent(getApplication(), LocationService::class.java).also {
+                        it.action = LocationService.ACTION_STOP
+                        getApplication<Application>().startService(it)
+                    }
+                    _uiEvent.emit(UiEvent.ShowToast("You are now offline."))
+                }
             }.onFailure {
-                _uiEvent.emit(UiEvent.ShowToast("Failed to update status: ${it.message}"))
+                _profileState.value = currentProfile.copy(isAvailable = oldStatus)
+                _uiEvent.emit(UiEvent.ShowToast("Failed to update status. Please try again."))
             }
         }
     }
@@ -488,6 +467,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     fun logout() {
         SessionManager.clearSession(getApplication())
         _profileState.value = null
+        Intent(getApplication(), LocationService::class.java).also {
+            it.action = LocationService.ACTION_STOP
+            getApplication<Application>().startService(it)
+        }
     }
 
     suspend fun updateProfile(name: String, vehicleModel: String, vehicleNumber: String, drivingLicense: String, imageUri: Uri?): Boolean {
@@ -506,7 +489,6 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 }
 
-
 class RiderViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(RiderViewModel::class.java)) {
@@ -520,68 +502,11 @@ class RiderViewModelFactory(private val application: Application) : ViewModelPro
 sealed class UiEvent {
     data class ShowToast(val message: String) : UiEvent()
     object LoginSuccess : UiEvent()
-    data object NavigateToOrders : UiEvent()
+    object NavigateToOrders : UiEvent()
 }
+// endregion
 
-@Composable
-fun LoginScreen(navController: NavController, riderViewModel: RiderViewModel = viewModel(factory = RiderViewModelFactory(LocalContext.current.applicationContext as Application))) {
-    val context = LocalContext.current
-    val isLoading by riderViewModel.isLoading.collectAsState()
-
-    // Navigate on successful login
-    LaunchedEffect(Unit) {
-        riderViewModel.uiEvent.collect { event ->
-            when (event) {
-                is UiEvent.ShowToast -> Toast.makeText(context, event.message, Toast.LENGTH_SHORT).show()
-                is UiEvent.LoginSuccess -> {
-                    Toast.makeText(context, "Login Successful!", Toast.LENGTH_SHORT).show()
-                    navController.navigate(AppRoutes.HOME) {
-                        popUpTo(AppRoutes.LOGIN) { inclusive = true }
-                    }
-                }
-                else -> {}
-            }
-        }
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp)
-            .statusBarsPadding()
-            .navigationBarsPadding(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        var username by remember { mutableStateOf("") }
-        var password by remember { mutableStateOf("") }
-
-        Icon(Icons.Default.TwoWheeler, "Rider Icon", modifier = Modifier.size(80.dp), tint = PrimaryRed)
-        Spacer(Modifier.height(16.dp))
-        Text("Rider Login", style = MaterialTheme.typography.headlineMedium)
-        Spacer(Modifier.height(32.dp))
-        OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("Username") }, modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(16.dp))
-        OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("Password") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(24.dp))
-
-        if (isLoading) {
-            CircularProgressIndicator()
-        } else {
-            Button(
-                onClick = {
-                    if (username.isNotBlank() && password.isNotBlank()) {
-                        riderViewModel.login(username, password)
-                    } else {
-                        Toast.makeText(context, "Please enter username and password", Toast.LENGTH_SHORT).show()
-                    }
-                },
-                modifier = Modifier.fillMaxWidth().height(56.dp)
-            ) { Text("Login") }
-        }
-    }
-}
-
+// region UI Layer
 private val PrimaryRed = Color(0xFFE53935)
 private val DarkGray = Color(0xFF424242)
 private val SurfaceGrey = Color(0xFFF5F5F5)
@@ -659,16 +584,16 @@ fun MainScreen(riderViewModel: RiderViewModel) {
     }
 }
 
-
 @Composable
 fun AppNavigation(navController: NavHostController, riderViewModel: RiderViewModel, paddingValues: PaddingValues) {
+    val startDestination = if (SessionManager.getAuthToken(LocalContext.current) != null) AppRoutes.HOME else AppRoutes.LOGIN
     NavHost(
         navController = navController,
-        startDestination = AppRoutes.LOGIN,
+        startDestination = startDestination,
         modifier = Modifier.padding(paddingValues)
     ) {
         composable(AppRoutes.LOGIN) {
-            LoginScreen(navController = navController)
+            LoginScreen(navController = navController, riderViewModel = riderViewModel)
         }
         composable(AppRoutes.HOME) {
             HomeScreen(navController = navController, viewModel = riderViewModel)
@@ -717,15 +642,11 @@ fun AppBottomNavigation(navController: NavController) {
     }
 }
 
-
 @Composable
-fun LoginScreen(navController: NavController) {
-    // The ViewModel should be instantiated here to be used by the screen
-    val riderViewModel: RiderViewModel = viewModel(factory = RiderViewModelFactory(LocalContext.current.applicationContext as Application))
+fun LoginScreen(navController: NavController, riderViewModel: RiderViewModel) {
     val context = LocalContext.current
     val isLoading by riderViewModel.isLoading.collectAsState()
 
-    // This block listens for events from the ViewModel, like a successful login
     LaunchedEffect(Unit) {
         riderViewModel.uiEvent.collect { event ->
             when (event) {
@@ -768,8 +689,6 @@ fun LoginScreen(navController: NavController) {
             Button(
                 onClick = {
                     if (username.isNotBlank() && password.isNotBlank()) {
-                        // The LoginScreen now tells the ViewModel to log in,
-                        // instead of handling session logic itself.
                         riderViewModel.login(username, password)
                     } else {
                         Toast.makeText(context, "Please enter username and password", Toast.LENGTH_SHORT).show()
@@ -783,9 +702,42 @@ fun LoginScreen(navController: NavController) {
 
 @Composable
 fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
+    val context = LocalContext.current
     val profile by viewModel.profileState.collectAsState()
     val pendingOrders by viewModel.pendingOrders.collectAsState()
-    val context = LocalContext.current
+
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+        onResult = { permissions ->
+            if (permissions.getOrDefault(Manifest.permission.ACCESS_FINE_LOCATION, false)) {
+                viewModel.toggleAvailability()
+            } else {
+                Toast.makeText(context, "Location permission is required to go online.", Toast.LENGTH_LONG).show()
+            }
+        }
+    )
+
+    fun handleStatusChangeClick() {
+        val shouldGoOnline = !(profile?.isAvailable ?: false)
+        if (shouldGoOnline) {
+            val hasPermission = ActivityCompat.checkSelfPermission(
+                context, Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+
+            if (!hasPermission) {
+                locationPermissionLauncher.launch(
+                    arrayOf(
+                        Manifest.permission.ACCESS_FINE_LOCATION,
+                        Manifest.permission.ACCESS_COARSE_LOCATION
+                    )
+                )
+            } else {
+                viewModel.toggleAvailability()
+            }
+        } else {
+            viewModel.toggleAvailability()
+        }
+    }
 
     LaunchedEffect(Unit) {
         viewModel.uiEvent.collect { event ->
@@ -800,7 +752,7 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
             profile?.let {
                 HomeTopBar(
                     profile = it,
-                    onStatusChangeClick = { viewModel.toggleAvailability() },
+                    onStatusChangeClick = { handleStatusChangeClick() },
                     onProfileClick = { navController.navigate(AppRoutes.PROFILE) }
                 )
             }
@@ -977,7 +929,6 @@ fun AmountCollectionDialog(order: Order, onDismiss: () -> Unit, onSubmit: (Doubl
     )
 }
 
-
 @Composable
 fun BalanceSheetCard(balance: BalanceSheet) {
     Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(4.dp)) {
@@ -1087,7 +1038,6 @@ fun OrderTimer(acceptedTimestamp: Long?, timeLimitMinutes: Int) {
     Text(text = timeString, color = color, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp))
 }
 
-
 @Composable
 fun OrderDetailRow(icon: ImageVector, label: String, value: String, isHighlight: Boolean = false) {
     val contentColor = LocalContentColor.current
@@ -1101,7 +1051,6 @@ fun OrderDetailRow(icon: ImageVector, label: String, value: String, isHighlight:
     }
 }
 
-
 @Composable
 fun OrderStatusChip(status: OrderStatus) {
     val (text, bgColor) = when (status) {
@@ -1113,13 +1062,12 @@ fun OrderStatusChip(status: OrderStatus) {
     Text(text = text, color = Color.White, modifier = Modifier.background(bgColor, RoundedCornerShape(50)).padding(horizontal = 12.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium)
 }
 
-
 @Composable
 fun HomeTopBar(profile: RiderProfile, onStatusChangeClick: () -> Unit, onProfileClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp),
+            .padding(16.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
@@ -1302,14 +1250,19 @@ fun ProfileInfoRow(icon: ImageVector, label: String, value: String) {
     }
 }
 
+// This is the single, correct MainActivity that runs your entire application.
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // Correctly initialize the ViewModel using a factory
+        val riderViewModel: RiderViewModel by viewModels { RiderViewModelFactory(application) }
         setContent {
             HoneyRiderTheme {
-                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    val riderViewModel: RiderViewModel = viewModel(factory = RiderViewModelFactory(application))
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    // Start the main app screen, which contains all the navigation logic.
                     MainScreen(riderViewModel = riderViewModel)
                 }
             }
