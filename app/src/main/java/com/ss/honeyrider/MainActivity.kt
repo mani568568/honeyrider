@@ -627,7 +627,9 @@ fun OrdersScreen(viewModel: RiderViewModel) {
                             DropdownMenuItem(text = { Text("Aborted") }, onClick = { viewModel.setProcessedOrderFilter(ProcessedOrderFilter.REJECTED); showFilterMenu = false })
                         }
                     }
-                }
+                },
+                // ADD THIS LINE TO FIX THE ALIGNMENT
+                windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
             )
         }
     ) { padding ->
@@ -864,8 +866,7 @@ fun HomeTopBar(profile: RiderProfile, onStatusChangeClick: () -> Unit, onProfile
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            // .statusBarsPadding() // <-- REMOVE THIS LINE
-            .padding(horizontal = 16.dp, vertical = 8.dp),
+            .padding(horizontal = 16.dp), // Only horizontal padding
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
@@ -958,7 +959,11 @@ fun ProfileScreen(navController: NavController, viewModel: RiderViewModel) {
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text("My Profile") })
+            TopAppBar(
+                title = { Text("My Profile") },
+                // ADD THIS LINE TO FIX THE ALIGNMENT
+                windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
+            )
         }
     ) { padding ->
         profile?.let {
@@ -1001,7 +1006,9 @@ fun EditProfileScreen(navController: NavController, viewModel: RiderViewModel) {
             TopAppBar(
                 title = { Text("Edit Profile") },
                 navigationIcon = { IconButton(onClick = { navController.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
-                actions = { IconButton(onClick = { scope.launch { if (viewModel.updateProfile(name, vehicleModel, vehicleNumber, imageUri)) navController.popBackStack() } }) { Icon(Icons.Default.Save, "Save") } }
+                actions = { IconButton(onClick = { scope.launch { if (viewModel.updateProfile(name, vehicleModel, vehicleNumber, imageUri)) navController.popBackStack() } }) { Icon(Icons.Default.Save, "Save") } },
+                // ADD THIS LINE TO FIX THE ALIGNMENT
+                windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
             )
         }
     ) { padding ->
