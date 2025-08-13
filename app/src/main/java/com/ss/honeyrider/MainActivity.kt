@@ -80,9 +80,8 @@ data class Order(
     val restaurantName: String,
     val pickupAddress: String,
     val deliveryAddress: String,
-    // val earnings: Double, // REMOVED
     var status: OrderStatus,
-    var tipAmount: Double, // Tip is now mutable and starts at 0
+    var tipAmount: Double,
     val itemCount: Int,
     val timeLimitMinutes: Int,
     val acceptedTimestamp: Long? = null,
@@ -97,7 +96,6 @@ data class Order(
 
 
 data class BalanceSheet(
-    // val totalEarnings: Double, // REMOVED
     val tips: Double
 )
 
@@ -130,7 +128,6 @@ object SessionManager {
 
 object FakeRepository {
     private val sampleOrders = MutableStateFlow(listOf(
-        // "earnings" parameter removed from Order constructor
         Order("ORD-101", "Pizza Junction", "123 MG Road, Koramangala", "456 Indiranagar, 5th Main", OrderStatus.PENDING, 0.0, 3, 5, orderTotal = 750.0, deliveryCharge = 40.0, surgeCharge = 10.0)
     ))
 
@@ -138,7 +135,6 @@ object FakeRepository {
         1L to RiderProfile(1L, "rider_one", "Suresh Kumar", "Honda Activa", "AP 39 AB 1234", null, true)
     )
 
-    // "totalEarnings" removed from BalanceSheet
     private val balanceSheet = MutableStateFlow(BalanceSheet(tips = 0.0))
 
 
@@ -184,13 +180,11 @@ object FakeRepository {
     suspend fun completeOrder(orderId: String, additionalTip: Double) {
         val order = sampleOrders.value.find { it.id == orderId }
         if (order != null) {
-            // Update to no longer add to totalEarnings
             balanceSheet.update {
                 it.copy(
                     tips = it.tips + additionalTip
                 )
             }
-            // Update the specific order with the new tip and status
             sampleOrders.update { currentOrders ->
                 currentOrders.map {
                     if (it.id == orderId) {
@@ -247,12 +241,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             ProcessedOrderFilter.ALL -> orders.filter { it.status != OrderStatus.PENDING }
             else -> orders.filter { it.status.name == filter.name }
         }
-        // Sort by the latest available timestamp, descending (newest first)
         filteredList.sortedByDescending { it.completionTimestamp ?: it.acceptedTimestamp ?: 0L }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
 
-    // Updated default BalanceSheet value
     val balanceSheet = repository.balance.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), BalanceSheet(tips = 0.0))
 
 
@@ -354,7 +346,7 @@ private val SurfaceGrey = Color(0xFFF5F5F5)
 private val LightGray = Color(0xFFBDBDBD)
 private val GreenAccept = Color(0xFF4CAF50)
 private val PurpleAccept = Color(0xFF673AB7)
-private val OrangeAccepted = Color(0xFFFFA726) // Orange for accepted orders
+private val OrangeAccepted = Color(0xFFFFA726)
 
 private val AppColorScheme = lightColorScheme(
     primary = PrimaryRed,
@@ -411,6 +403,13 @@ fun MainScreen(riderViewModel: RiderViewModel) {
         bottomBar = {
             if (shouldShowBottomBar) {
                 AppBottomNavigation(navController = navController)
+            }
+        },
+        floatingActionButton = {
+            if (currentRoute == AppRoutes.PROFILE) {
+                FloatingActionButton(onClick = { navController.navigate(AppRoutes.EDIT_PROFILE) }) {
+                    Icon(Icons.Default.Edit, "Edit Profile")
+                }
             }
         }
     ) { innerPadding ->
@@ -535,18 +534,12 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
 
     LaunchedEffect(Unit) {
         viewModel.uiEvent.collect { event ->
-            when (event) {
-                is UiEvent.ShowToast -> {
-                    Toast.makeText(context, event.message, Toast.LENGTH_SHORT).show()
-                }
-                is UiEvent.NavigateToOrders -> {
-                    navController.navigate(AppRoutes.ORDERS)
-                }
+            if (event is UiEvent.ShowToast) {
+                Toast.makeText(context, event.message, Toast.LENGTH_SHORT).show()
             }
         }
     }
 
-    // Scaffold now manages the top padding via its topBar
     Scaffold(
         topBar = {
             profile?.let {
@@ -638,7 +631,11 @@ fun OrdersScreen(viewModel: RiderViewModel) {
             )
         }
     ) { padding ->
-        LazyColumn(modifier = Modifier.padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        LazyColumn(
+            modifier = Modifier.padding(padding).fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
             item { BalanceSheetCard(balance = balanceSheet) }
             item {
                 val filterText = when (selectedFilter) {
@@ -867,16 +864,29 @@ fun HomeTopBar(profile: RiderProfile, onStatusChangeClick: () -> Unit, onProfile
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .statusBarsPadding()
-            .padding(16.dp),
+            // .statusBarsPadding() // <-- REMOVE THIS LINE
+            .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(text = "Welcome, ${profile.name}!", style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(text = profile.vehicleNumber, style = MaterialTheme.typography.bodyMedium, color = LightGray)
+        Column(modifier = Modifier.weight(1f, fill = false)) {
+            Text(
+                text = profile.name,
+                style = MaterialTheme.typography.titleLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = profile.vehicleNumber,
+                style = MaterialTheme.typography.bodyMedium,
+                color = LightGray
+            )
         }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(
+            modifier = Modifier.padding(start = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
             AvailabilityIndicator(isAvailable = profile.isAvailable, onClick = onStatusChangeClick)
             val placeholderPainter = rememberVectorPainter(image = Icons.Default.AccountCircle)
             AsyncImage(model = profile.imageUrl, contentDescription = "Rider Profile", modifier = Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onProfileClick), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
@@ -947,11 +957,19 @@ fun ProfileScreen(navController: NavController, viewModel: RiderViewModel) {
     val profile by viewModel.profileState.collectAsState()
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("My Profile") }) },
-        floatingActionButton = { FloatingActionButton(onClick = { navController.navigate(AppRoutes.EDIT_PROFILE) }) { Icon(Icons.Default.Edit, "Edit Profile") } }
+        topBar = {
+            TopAppBar(title = { Text("My Profile") })
+        }
     ) { padding ->
         profile?.let {
-            Column(modifier = Modifier.padding(padding).fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Column(
+                modifier = Modifier
+                    .padding(padding)
+                    .fillMaxSize()
+                    .padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
                 val placeholderPainter = rememberVectorPainter(image = Icons.Default.AccountCircle)
                 AsyncImage(model = it.imageUrl, contentDescription = "Profile Picture", modifier = Modifier.size(120.dp).clip(CircleShape), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
                 Text(it.name, style = MaterialTheme.typography.headlineSmall)
@@ -1003,7 +1021,7 @@ fun EditProfileScreen(navController: NavController, viewModel: RiderViewModel) {
 }
 
 @Composable
-fun ProfileInfoRow(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, value: String) {
+fun ProfileInfoRow(icon: ImageVector, label: String, value: String) {
     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         Icon(icon, contentDescription = label, tint = PrimaryRed, modifier = Modifier.size(24.dp))
         Spacer(Modifier.width(16.dp))
@@ -1020,7 +1038,7 @@ fun ProfileInfoRow(icon: androidx.compose.ui.graphics.vector.ImageVector, label:
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge() // Enables drawing behind system bars
+        enableEdgeToEdge()
         setContent {
             HoneyRiderTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
