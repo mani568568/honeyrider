@@ -79,7 +79,7 @@ data class Order(
     val restaurantName: String,
     val pickupAddress: String,
     val deliveryAddress: String,
-    val earnings: Double,
+    // val earnings: Double, // REMOVED
     var status: OrderStatus,
     var tipAmount: Double, // Tip is now mutable and starts at 0
     val itemCount: Int,
@@ -96,7 +96,7 @@ data class Order(
 
 
 data class BalanceSheet(
-    val totalEarnings: Double,
+    // val totalEarnings: Double, // REMOVED
     val tips: Double
 )
 
@@ -128,19 +128,17 @@ object SessionManager {
 
 
 object FakeRepository {
-    // *** THE FIX IS HERE ***
-    // Initial order has a tipAmount of 0.0
     private val sampleOrders = MutableStateFlow(listOf(
-        Order("ORD-101", "Pizza Junction", "123 MG Road, Koramangala", "456 Indiranagar, 5th Main", 55.00, OrderStatus.PENDING, 0.0, 3, 5, orderTotal = 750.0, deliveryCharge = 40.0, surgeCharge = 10.0)
+        // "earnings" parameter removed from Order constructor
+        Order("ORD-101", "Pizza Junction", "123 MG Road, Koramangala", "456 Indiranagar, 5th Main", OrderStatus.PENDING, 0.0, 3, 5, orderTotal = 750.0, deliveryCharge = 40.0, surgeCharge = 10.0)
     ))
 
     private val sampleRiders = mutableMapOf(
         1L to RiderProfile(1L, "rider_one", "Suresh Kumar", "Honda Activa", "AP 39 AB 1234", null, true)
     )
 
-    // *** THE FIX IS HERE ***
-    // Balance sheet starts at zero for a new rider.
-    private val balanceSheet = MutableStateFlow(BalanceSheet(totalEarnings = 0.0, tips = 0.0))
+    // "totalEarnings" removed from BalanceSheet
+    private val balanceSheet = MutableStateFlow(BalanceSheet(tips = 0.0))
 
 
     val orders: StateFlow<List<Order>> = sampleOrders.asStateFlow()
@@ -182,14 +180,12 @@ object FakeRepository {
         }
     }
 
-    // *** THE FIX IS HERE ***
-    // This function now also updates the order itself with the new tip amount.
     suspend fun completeOrder(orderId: String, additionalTip: Double) {
         val order = sampleOrders.value.find { it.id == orderId }
         if (order != null) {
+            // Update to no longer add to totalEarnings
             balanceSheet.update {
                 it.copy(
-                    totalEarnings = it.totalEarnings + order.earnings,
                     tips = it.tips + additionalTip
                 )
             }
@@ -250,7 +246,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
 
-    val balanceSheet = repository.balance.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), BalanceSheet(0.0, 0.0))
+    // Updated default BalanceSheet value
+    val balanceSheet = repository.balance.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), BalanceSheet(0.0))
 
 
     init {
@@ -611,7 +608,7 @@ fun OrdersScreen(viewModel: RiderViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Order History & Earnings") },
+                title = { Text("Order History & Tips") }, // UPDATED TITLE
                 actions = {
                     Box {
                         IconButton(onClick = { showFilterMenu = true }) { Icon(Icons.Default.FilterList, contentDescription = "Filter Orders") }
@@ -709,9 +706,9 @@ fun AmountCollectionDialog(order: Order, onDismiss: () -> Unit, onSubmit: (Doubl
 fun BalanceSheetCard(balance: BalanceSheet) {
     Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(4.dp)) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Your Earnings", style = MaterialTheme.typography.headlineSmall)
+            Text("Your Tips", style = MaterialTheme.typography.headlineSmall) // UPDATED TITLE
             Divider()
-            BalanceRow("Total Earnings", balance.totalEarnings)
+            // BalanceRow("Total Earnings", balance.totalEarnings) // REMOVED
             BalanceRow("Tips Collected", balance.tips)
         }
     }
@@ -757,8 +754,6 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                     OrderDetailRow(icon = Icons.Default.Home, label = "Delivery", value = order.deliveryAddress)
                     OrderDetailRow(icon = Icons.Default.ShoppingBag, label = "Items", value = "${order.itemCount} Items")
                     Divider(modifier = Modifier.padding(vertical = 12.dp))
-                    // *** UI UPDATE ***
-                    // Detailed payment breakdown added here
                     OrderDetailRow(icon = Icons.Default.Receipt, label = "Order Total", value = "₹%.2f".format(order.orderTotal))
                     OrderDetailRow(icon = Icons.Default.TwoWheeler, label = "Delivery Charge", value = "₹%.2f".format(order.deliveryCharge))
                     OrderDetailRow(icon = Icons.Default.FlashOn, label = "Surge Charge", value = "₹%.2f".format(order.surgeCharge))
@@ -767,7 +762,7 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                     if (order.tipAmount > 0) {
                         OrderDetailRow(icon = Icons.Default.Favorite, label = "Tip Received", value = "₹%.2f".format(order.tipAmount))
                     }
-                    OrderDetailRow(icon = Icons.Default.AccountBalanceWallet, label = "Your Earnings", value = "₹%.2f".format(order.earnings), isHighlight = true)
+                    // OrderDetailRow for "Your Earnings" has been removed
                 }
             }
 
@@ -873,10 +868,9 @@ fun OrderRequestCard(order: Order, onAccept: () -> Unit, onDeny: () -> Unit) {
                 InfoColumn("Drop", order.deliveryAddress, alignEnd = true)
             }
             Divider(modifier = Modifier.padding(vertical = 12.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Earnings", style = MaterialTheme.typography.bodyLarge)
-                Text("₹${order.earnings}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = GreenAccept)
-            }
+
+            // The "Earnings" Row has been removed from here.
+
             Spacer(Modifier.height(16.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 Button(onClick = onDeny, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) { Text("Deny") }
