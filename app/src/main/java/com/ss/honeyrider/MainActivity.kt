@@ -1,7 +1,12 @@
 package com.ss.honeyrider
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import androidx.core.app.NotificationCompat
 import android.Manifest
 import android.app.Application
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -9,6 +14,7 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.location.Location // Import Android's Location class
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.Looper
@@ -18,6 +24,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.annotation.RequiresApi
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
@@ -292,25 +299,29 @@ class LocationService : Service() {
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var locationCallback: LocationCallback
 
-    // Caches the most recent location received from the location client.
     private var lastLocation: Location? = null
 
     companion object {
         const val ACTION_START = "com.ss.honeyrider.ACTION_START"
         const val ACTION_STOP = "com.ss.honeyrider.ACTION_STOP"
         private const val LOCATION_UPDATE_INTERVAL_MS = 3000L // 3 seconds
+
+        // Constants for the Foreground Notification
+        private const val NOTIFICATION_CHANNEL_ID = "LocationServiceChannel"
+        private const val NOTIFICATION_ID = 101 // Must be a unique integer
     }
 
+    @RequiresApi(Build.VERSION_CODES.O)
     override fun onCreate() {
         super.onCreate()
-        // Initialize repository and location client when the service is created.
         repository = RiderRepository(RetrofitInstance.create(this), this)
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
-        // This callback is triggered whenever the FusedLocationProviderClient has a new location.
+        // Create the notification channel when the service is created
+        createNotificationChannel()
+
         locationCallback = object : LocationCallback() {
             override fun onLocationResult(locationResult: LocationResult) {
-                // The locationResult might contain multiple locations; we only need the latest one.
                 lastLocation = locationResult.lastLocation
                 println("Location Updated: Lat=${lastLocation?.latitude}, Lon=${lastLocation?.longitude}")
             }
@@ -320,60 +331,89 @@ class LocationService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                println("Location service started")
+                println("Location service starting in foreground")
+
+                // 1. Build the persistent notification
+                val notification = buildNotification()
+
+                // 2. THIS IS THE KEY: Promote the service to a foreground service
+                startForeground(NOTIFICATION_ID, notification)
+
                 startLocationUpdates()
-                // Launch a coroutine that runs as long as the service is active.
+
                 serviceScope.launch {
-                    // This loop will continuously send location updates every 3 seconds.
                     while (true) {
                         delay(LOCATION_UPDATE_INTERVAL_MS)
                         lastLocation?.let { location ->
                             println("Sending location to server: Lat=${location.latitude}, Lon=${location.longitude}")
-                            // Call the suspend function to update the server with the latest location.
                             repository.updateRiderLocation(location.latitude, location.longitude)
                         }
                     }
                 }
             }
             ACTION_STOP -> {
-                println("Location service stopped")
+                println("Location service stopping")
                 stopSelf() // This will trigger onDestroy().
             }
         }
-        // START_STICKY ensures the service restarts if the system kills it.
         return START_STICKY
     }
 
     private fun startLocationUpdates() {
-        // A service can't request permissions. They must be granted by the user in the UI (Activity)
-        // before this service is started. This is a crucial safety check.
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             println("Location permission not granted. Stopping service.")
-            stopSelf() // Stop the service if permissions are missing to prevent a crash.
+            stopSelf()
             return
         }
-
-        // Configure the parameters for location requests.
         val locationRequest = LocationRequest.Builder(
-            Priority.PRIORITY_HIGH_ACCURACY, // High accuracy is needed for delivery tracking.
+            Priority.PRIORITY_HIGH_ACCURACY,
             LOCATION_UPDATE_INTERVAL_MS
         ).build()
-
-        // Start listening for location updates. The callback will be triggered on the main thread.
         fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper())
         println("Requesting location updates.")
     }
 
+    // Helper function to build the notification
+    private fun buildNotification(): Notification {
+        // Tapping the notification will open the app
+        val pendingIntent = Intent(this, MainActivity::class.java).let { notificationIntent ->
+            PendingIntent.getActivity(this, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE)
+        }
+
+        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("You are Online")
+            .setContentText("Your location is being shared for new orders.")
+            .setSmallIcon(R.drawable.ic_launcher_foreground) // Replace with your app's icon
+            .setContentIntent(pendingIntent)
+            .setOngoing(true) // Makes the notification non-dismissable
+            .build()
+    }
+
+    // Helper function to create the Notification Channel (required for Android 8+)
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun createNotificationChannel() {
+        val name = "Location Service"
+        val descriptionText = "Shows when the rider is online and sharing location."
+        val importance = NotificationManager.IMPORTANCE_LOW // Use LOW to avoid sound/vibration
+        val channel = NotificationChannel(NOTIFICATION_CHANNEL_ID, name, importance).apply {
+            description = descriptionText
+        }
+        // Register the channel with the system
+        val notificationManager: NotificationManager =
+            getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.createNotificationChannel(channel)
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        // It's crucial to clean up resources when the service is destroyed.
-        serviceJob.cancel() // Stop all coroutines launched in the serviceScope.
-        fusedLocationClient.removeLocationUpdates(locationCallback) // Stop listening for location updates to save battery.
+        serviceJob.cancel()
+        fusedLocationClient.removeLocationUpdates(locationCallback)
+        // When the service is destroyed, also remove the notification
+        stopForeground(STOP_FOREGROUND_REMOVE)
         println("Location service destroyed and updates stopped.")
     }
 
     override fun onBind(intent: Intent?): IBinder? {
-        // We are not using a bound service, so we return null.
         return null
     }
 }
