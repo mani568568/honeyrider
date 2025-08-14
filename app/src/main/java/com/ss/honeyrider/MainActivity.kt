@@ -7,9 +7,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.location.Location // Import Android's Location class
 import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
+import android.os.Looper
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -60,8 +62,9 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import coil.compose.AsyncImage
+import com.google.android.gms.location.* // <-- IMPORT GMS Location
 import com.google.gson.Gson
-import com.google.gson.annotations.SerializedName // <-- IMPORT THIS
+import com.google.gson.annotations.SerializedName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -152,7 +155,6 @@ data class RiderProfile(
     val vehicleNumber: String,
     val drivingLicense: String,
     val imageUrl: String?,
-    // This annotation tells Gson to map the "available" JSON field to this property.
     @SerializedName("available")
     val isAvailable: Boolean
 )
@@ -243,6 +245,7 @@ class RiderRepository(private val apiService: ApiService, private val context: C
         try {
             apiService.updateRiderLocation(LocationUpdateRequest(latitude, longitude))
         } catch (e: Exception) {
+            // Log the error for debugging purposes
             e.printStackTrace()
         }
     }
@@ -285,30 +288,92 @@ class LocationService : Service() {
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
+    private lateinit var repository: RiderRepository
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private lateinit var locationCallback: LocationCallback
+
+    // Caches the most recent location received from the location client.
+    private var lastLocation: Location? = null
+
     companion object {
         const val ACTION_START = "com.ss.honeyrider.ACTION_START"
         const val ACTION_STOP = "com.ss.honeyrider.ACTION_STOP"
+        private const val LOCATION_UPDATE_INTERVAL_MS = 3000L // 3 seconds
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        // Initialize repository and location client when the service is created.
+        repository = RiderRepository(RetrofitInstance.create(this), this)
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+
+        // This callback is triggered whenever the FusedLocationProviderClient has a new location.
+        locationCallback = object : LocationCallback() {
+            override fun onLocationResult(locationResult: LocationResult) {
+                // The locationResult might contain multiple locations; we only need the latest one.
+                lastLocation = locationResult.lastLocation
+                println("Location Updated: Lat=${lastLocation?.latitude}, Lon=${lastLocation?.longitude}")
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
                 println("Location service started")
+                startLocationUpdates()
+                // Launch a coroutine that runs as long as the service is active.
+                serviceScope.launch {
+                    // This loop will continuously send location updates every 3 seconds.
+                    while (true) {
+                        delay(LOCATION_UPDATE_INTERVAL_MS)
+                        lastLocation?.let { location ->
+                            println("Sending location to server: Lat=${location.latitude}, Lon=${location.longitude}")
+                            // Call the suspend function to update the server with the latest location.
+                            repository.updateRiderLocation(location.latitude, location.longitude)
+                        }
+                    }
+                }
             }
             ACTION_STOP -> {
                 println("Location service stopped")
-                stopSelf()
+                stopSelf() // This will trigger onDestroy().
             }
         }
-        return START_NOT_STICKY
+        // START_STICKY ensures the service restarts if the system kills it.
+        return START_STICKY
+    }
+
+    private fun startLocationUpdates() {
+        // A service can't request permissions. They must be granted by the user in the UI (Activity)
+        // before this service is started. This is a crucial safety check.
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            println("Location permission not granted. Stopping service.")
+            stopSelf() // Stop the service if permissions are missing to prevent a crash.
+            return
+        }
+
+        // Configure the parameters for location requests.
+        val locationRequest = LocationRequest.Builder(
+            Priority.PRIORITY_HIGH_ACCURACY, // High accuracy is needed for delivery tracking.
+            LOCATION_UPDATE_INTERVAL_MS
+        ).build()
+
+        // Start listening for location updates. The callback will be triggered on the main thread.
+        fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper())
+        println("Requesting location updates.")
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        serviceJob.cancel()
+        // It's crucial to clean up resources when the service is destroyed.
+        serviceJob.cancel() // Stop all coroutines launched in the serviceScope.
+        fusedLocationClient.removeLocationUpdates(locationCallback) // Stop listening for location updates to save battery.
+        println("Location service destroyed and updates stopped.")
     }
 
     override fun onBind(intent: Intent?): IBinder? {
+        // We are not using a bound service, so we return null.
         return null
     }
 }
@@ -1250,11 +1315,9 @@ fun ProfileInfoRow(icon: ImageVector, label: String, value: String) {
     }
 }
 
-// This is the single, correct MainActivity that runs your entire application.
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Correctly initialize the ViewModel using a factory
         val riderViewModel: RiderViewModel by viewModels { RiderViewModelFactory(application) }
         setContent {
             HoneyRiderTheme {
@@ -1262,7 +1325,6 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    // Start the main app screen, which contains all the navigation logic.
                     MainScreen(riderViewModel = riderViewModel)
                 }
             }

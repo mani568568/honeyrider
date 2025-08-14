@@ -70,6 +70,7 @@ dependencies {
     implementation(libs.converter.gson)
     implementation(libs.logging.interceptor)
     implementation(libs.coil.compose)
+    implementation(libs.play.services.location.v2120)
 
     // Testing libraries
     testImplementation(libs.junit)
