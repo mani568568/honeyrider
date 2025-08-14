@@ -1,1371 +1,273 @@
 package com.ss.honeyrider
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import androidx.core.app.NotificationCompat
-import android.Manifest
-import android.app.Application
-import android.app.PendingIntent
-import android.app.Service
-import android.content.Context
-import android.content.Intent
-import android.content.SharedPreferences
-import android.content.pm.PackageManager
-import android.location.Location // Import Android's Location class
-import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.os.IBinder
-import android.os.Looper
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.viewModels
-import androidx.annotation.RequiresApi
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.ReceiptLong
-import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.graphics.vector.rememberVectorPainter
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.app.ActivityCompat
-import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
-import androidx.navigation.NavController
-import androidx.navigation.NavHostController
-import androidx.navigation.compose.NavHost
-import androidx.navigation.compose.composable
-import androidx.navigation.compose.currentBackStackEntryAsState
-import androidx.navigation.compose.rememberNavController
-import coil.compose.AsyncImage
-import com.google.android.gms.location.* // <-- IMPORT GMS Location
-import com.google.gson.Gson
-import com.google.gson.annotations.SerializedName
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.*
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.google.android.gms.maps.model.CameraPosition
+import com.google.android.gms.maps.model.LatLng
+import com.google.maps.android.compose.GoogleMap
+import com.google.maps.android.compose.Marker
+import com.google.maps.android.compose.MarkerState
+import com.google.maps.android.compose.rememberCameraPositionState
+import com.ss.honeyrider.ui.theme.HoneyRiderTheme
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.MultipartBody
-import okhttp3.OkHttpClient
-import okhttp3.RequestBody.Companion.asRequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import okhttp3.logging.HttpLoggingInterceptor
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
-import retrofit2.http.*
-import java.io.File
-import java.util.concurrent.TimeUnit
-import kotlin.math.abs
+import retrofit2.http.GET
+import retrofit2.http.POST
+import retrofit2.http.PUT
+import retrofit2.http.Path
+import retrofit2.http.Query
 
-// region Network Layer
-data class LoginRequest(val username: String, val password: String)
-data class LoginResponse(val token: String, val id: Long)
-data class AvailabilityRequest(val isAvailable: Boolean)
-data class LocationUpdateRequest(val latitude: Double, val longitude: Double)
 
-class AuthInterceptor(private val context: Context) : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val requestBuilder = chain.request().newBuilder()
-        SessionManager.getAuthToken(context)?.let { token ->
-            requestBuilder.addHeader("Authorization", "Bearer $token")
-        }
-        return chain.proceed(requestBuilder.build())
-    }
-}
-
-interface ApiService {
-    @POST("api/auth/rider/login")
-    suspend fun login(@Body request: LoginRequest): LoginResponse
-
-    @GET("api/riders/profile")
-    suspend fun getRiderProfile(): RiderProfile
-
-    @PUT("api/riders/status")
-    suspend fun updateRiderStatus(@Body isAvailable: AvailabilityRequest): RiderProfile
-
-    @PUT("api/riders/location")
-    suspend fun updateRiderLocation(@Body location: LocationUpdateRequest)
-
-    @Multipart
-    @PUT("api/riders/profile")
-    suspend fun updateRiderProfile(
-        @Part("profile") profile: okhttp3.RequestBody,
-        @Part image: MultipartBody.Part?
-    ): RiderProfile
-}
-
-object RetrofitInstance {
-    private const val BASE_URL = "http://192.168.31.242:8080/"
-
-    fun create(context: Context): ApiService {
-        val logging = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BODY
-        }
-        val client = OkHttpClient.Builder()
-            .addInterceptor(AuthInterceptor(context))
-            .addInterceptor(logging)
-            .build()
-
-        return Retrofit.Builder()
-            .baseUrl(BASE_URL)
-            .client(client)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(ApiService::class.java)
-    }
-}
-// endregion
-
-// region Data Layer
-data class RiderProfile(
-    val id: Long,
-    val username: String,
-    val name: String,
-    val vehicleModel: String,
-    val vehicleNumber: String,
-    val drivingLicense: String,
-    val imageUrl: String?,
-    @SerializedName("available")
-    val isAvailable: Boolean
+// --- Data Classes ---
+data class RiderDeliveryDetails(
+    val orderId: Long,
+    val status: String,
+    val vendorName: String,
+    val vendorAddress: String,
+    val vendorLatitude: Double,
+    val vendorLongitude: Double,
+    val customerAddress: String,
+    val customerLatitude: Double,
+    val customerLongitude: Double,
+    val pickupOtp: String?
 )
 
-data class Order(
-    val id: String,
-    val restaurantName: String,
-    val pickupAddress: String,
-    val deliveryAddress: String,
-    var status: OrderStatus,
-    var tipAmount: Double,
-    val itemCount: Int,
-    val timeLimitMinutes: Int,
-    val acceptedTimestamp: Long? = null,
-    val completionTimestamp: Long? = null,
-    val orderTotal: Double,
-    val deliveryCharge: Double,
-    val surgeCharge: Double
-) {
-    val cashToCollect: Double
-        get() = orderTotal + deliveryCharge + surgeCharge
+// --- ApiService Interface ---
+interface ApiService {
+    @GET("api/orders/{orderId}/delivery-details")
+    suspend fun getDeliveryDetails(@Path("orderId") orderId: Long): RiderDeliveryDetails
+
+    @POST("api/orders/{orderId}/confirm-pickup")
+    suspend fun confirmPickup(@Path("orderId") orderId: Long, @Query("otp") otp: String)
+
+    // Add other necessary endpoints here
 }
 
-data class BalanceSheet(val tips: Double)
+// --- ViewModel ---
+class DeliveryViewModel(private val apiService: ApiService) : ViewModel() {
 
-enum class OrderStatus {
-    PENDING, ACCEPTED, REJECTED, COMPLETED
-}
+    private val _deliveryDetails = MutableStateFlow<RiderDeliveryDetails?>(null)
+    val deliveryDetails: StateFlow<RiderDeliveryDetails?> = _deliveryDetails.asStateFlow()
 
-object SessionManager {
-    private const val PREFS_NAME = "RiderPrefs"
-    private const val KEY_RIDER_ID = "rider_id"
-    private const val KEY_AUTH_TOKEN = "auth_token"
-    private const val DEFAULT_RIDER_ID = -1L
+    private val _isPickupConfirmed = MutableStateFlow(false)
+    val isPickupConfirmed: StateFlow<Boolean> = _isPickupConfirmed.asStateFlow()
 
-    private fun getPrefs(context: Context): SharedPreferences {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    fun loadDeliveryDetails(orderId: Long) {
+        viewModelScope.launch {
+            try {
+                val details = apiService.getDeliveryDetails(orderId)
+                _deliveryDetails.value = details
+                if (details.status == "OUT_FOR_DELIVERY" || details.status == "DELIVERED") {
+                    _isPickupConfirmed.value = true
+                }
+            } catch (e: Exception) {
+                // Handle exceptions
+            }
+        }
     }
 
-    fun saveSession(context: Context, riderId: Long, token: String) {
-        getPrefs(context).edit()
-            .putLong(KEY_RIDER_ID, riderId)
-            .putString(KEY_AUTH_TOKEN, token)
-            .apply()
-    }
-
-    fun getRiderId(context: Context): Long {
-        return getPrefs(context).getLong(KEY_RIDER_ID, DEFAULT_RIDER_ID)
-    }
-
-    fun getAuthToken(context: Context): String? {
-        return getPrefs(context).getString(KEY_AUTH_TOKEN, null)
-    }
-
-    fun clearSession(context: Context) {
-        getPrefs(context).edit().clear().apply()
+    fun confirmPickup(orderId: Long, otp: String, onResult: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            try {
+                apiService.confirmPickup(orderId, otp)
+                _isPickupConfirmed.value = true
+                onResult(true)
+            } catch (e: Exception) {
+                onResult(false)
+            }
+        }
     }
 }
 
-class RiderRepository(private val apiService: ApiService, private val context: Context) {
-
-    suspend fun login(username: String, password: String): Result<LoginResponse> {
-        return try {
-            val response = apiService.login(LoginRequest(username, password))
-            Result.success(response)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    fun getRiderProfile(): Flow<Result<RiderProfile>> = flow {
-        try {
-            emit(Result.success(apiService.getRiderProfile()))
-        } catch (e: Exception) {
-            emit(Result.failure(e))
-        }
-    }
-
-    suspend fun updateRiderStatus(isAvailable: Boolean): Result<RiderProfile> {
-        return try {
-            Result.success(apiService.updateRiderStatus(AvailabilityRequest(isAvailable)))
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    suspend fun updateRiderLocation(latitude: Double, longitude: Double) {
-        try {
-            apiService.updateRiderLocation(LocationUpdateRequest(latitude, longitude))
-        } catch (e: Exception) {
-            // Log the error for debugging purposes
-            e.printStackTrace()
-        }
-    }
-
-    suspend fun updateRiderProfile(name: String, vehicleModel: String, vehicleNumber: String, drivingLicense: String, imageUri: Uri?): Result<RiderProfile> {
-        return try {
-            val profileMap = mapOf(
-                "name" to name,
-                "vehicleModel" to vehicleModel,
-                "vehicleNumber" to vehicleNumber,
-                "drivingLicense" to drivingLicense
-            )
-            val profileRequestBody = Gson().toJson(profileMap).toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
-
-            var imagePart: MultipartBody.Part? = null
-            imageUri?.let {
-                context.contentResolver.openInputStream(it)?.let { inputStream ->
-                    val file = File(context.cacheDir, "profile.jpg")
-                    file.createNewFile()
-                    file.outputStream().use { outputStream ->
-                        inputStream.copyTo(outputStream)
-                    }
-                    val requestFile = file.asRequestBody("image/jpeg".toMediaTypeOrNull())
-                    imagePart = MultipartBody.Part.createFormData("image", file.name, requestFile)
-                }
-            }
-
-            val updatedProfile = apiService.updateRiderProfile(profileRequestBody, imagePart)
-            Result.success(updatedProfile)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-}
-// endregion
-
-//region Service
-class LocationService : Service() {
-
-    private val serviceJob = SupervisorJob()
-    private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
-
-    private lateinit var repository: RiderRepository
-    private lateinit var fusedLocationClient: FusedLocationProviderClient
-    private lateinit var locationCallback: LocationCallback
-
-    private var lastLocation: Location? = null
-
-    companion object {
-        const val ACTION_START = "com.ss.honeyrider.ACTION_START"
-        const val ACTION_STOP = "com.ss.honeyrider.ACTION_STOP"
-        private const val LOCATION_UPDATE_INTERVAL_MS = 3000L // 3 seconds
-
-        // Constants for the Foreground Notification
-        private const val NOTIFICATION_CHANNEL_ID = "LocationServiceChannel"
-        private const val NOTIFICATION_ID = 101 // Must be a unique integer
-    }
-
-    @RequiresApi(Build.VERSION_CODES.O)
-    override fun onCreate() {
-        super.onCreate()
-        repository = RiderRepository(RetrofitInstance.create(this), this)
-        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-
-        // Create the notification channel when the service is created
-        createNotificationChannel()
-
-        locationCallback = object : LocationCallback() {
-            override fun onLocationResult(locationResult: LocationResult) {
-                lastLocation = locationResult.lastLocation
-                println("Location Updated: Lat=${lastLocation?.latitude}, Lon=${lastLocation?.longitude}")
-            }
-        }
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> {
-                println("Location service starting in foreground")
-
-                // 1. Build the persistent notification
-                val notification = buildNotification()
-
-                // 2. THIS IS THE KEY: Promote the service to a foreground service
-                startForeground(NOTIFICATION_ID, notification)
-
-                startLocationUpdates()
-
-                serviceScope.launch {
-                    while (true) {
-                        delay(LOCATION_UPDATE_INTERVAL_MS)
-                        lastLocation?.let { location ->
-                            println("Sending location to server: Lat=${location.latitude}, Lon=${location.longitude}")
-                            repository.updateRiderLocation(location.latitude, location.longitude)
-                        }
-                    }
-                }
-            }
-            ACTION_STOP -> {
-                println("Location service stopping")
-                stopSelf() // This will trigger onDestroy().
-            }
-        }
-        return START_STICKY
-    }
-
-    private fun startLocationUpdates() {
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            println("Location permission not granted. Stopping service.")
-            stopSelf()
-            return
-        }
-        val locationRequest = LocationRequest.Builder(
-            Priority.PRIORITY_HIGH_ACCURACY,
-            LOCATION_UPDATE_INTERVAL_MS
-        ).build()
-        fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper())
-        println("Requesting location updates.")
-    }
-
-    // Helper function to build the notification
-    private fun buildNotification(): Notification {
-        // Tapping the notification will open the app
-        val pendingIntent = Intent(this, MainActivity::class.java).let { notificationIntent ->
-            PendingIntent.getActivity(this, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE)
-        }
-
-        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("You are Online")
-            .setContentText("Your location is being shared for new orders.")
-            .setSmallIcon(R.drawable.ic_launcher_foreground) // Replace with your app's icon
-            .setContentIntent(pendingIntent)
-            .setOngoing(true) // Makes the notification non-dismissable
-            .build()
-    }
-
-    // Helper function to create the Notification Channel (required for Android 8+)
-    @RequiresApi(Build.VERSION_CODES.O)
-    private fun createNotificationChannel() {
-        val name = "Location Service"
-        val descriptionText = "Shows when the rider is online and sharing location."
-        val importance = NotificationManager.IMPORTANCE_LOW // Use LOW to avoid sound/vibration
-        val channel = NotificationChannel(NOTIFICATION_CHANNEL_ID, name, importance).apply {
-            description = descriptionText
-        }
-        // Register the channel with the system
-        val notificationManager: NotificationManager =
-            getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.createNotificationChannel(channel)
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        serviceJob.cancel()
-        fusedLocationClient.removeLocationUpdates(locationCallback)
-        // When the service is destroyed, also remove the notification
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        println("Location service destroyed and updates stopped.")
-    }
-
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
-}
-//endregion
-
-// region ViewModel
-enum class ProcessedOrderFilter { ALL, ACCEPTED, COMPLETED, REJECTED }
-
-class RiderViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = RiderRepository(RetrofitInstance.create(application), application)
-
-    private val _profileState = MutableStateFlow<RiderProfile?>(null)
-    val profileState = _profileState.asStateFlow()
-
-    private val _uiEvent = MutableSharedFlow<UiEvent>()
-    val uiEvent = _uiEvent.asSharedFlow()
-
-    private val _isLoading = MutableStateFlow(false)
-    val isLoading = _isLoading.asStateFlow()
-
-    private val _processedOrderFilter = MutableStateFlow(ProcessedOrderFilter.ALL)
-    val processedOrderFilter = _processedOrderFilter.asStateFlow()
-
-    private val _allOrders = MutableStateFlow(listOf(
-        Order("ORD-101", "Pizza Junction", "123 MG Road, Koramangala", "456 Indiranagar, 5th Main", OrderStatus.PENDING, 0.0, 3, 5, orderTotal = 750.0, deliveryCharge = 40.0, surgeCharge = 10.0),
-        Order("ORD-102", "Burger King", "789 Jayanagar, 4th Block", "101 HSR Layout, Sector 2", OrderStatus.ACCEPTED, 0.0, 2, 10, System.currentTimeMillis() - 120000, orderTotal = 550.0, deliveryCharge = 30.0, surgeCharge = 0.0)
-    ))
-    val allOrders: StateFlow<List<Order>> = _allOrders.asStateFlow()
-
-    val pendingOrders = _allOrders.map { orders ->
-        orders.filter { it.status == OrderStatus.PENDING }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
-    val processedOrders: StateFlow<List<Order>> = combine(_allOrders, _processedOrderFilter) { orders, filter ->
-        val filteredList = when (filter) {
-            ProcessedOrderFilter.ALL -> orders.filter { it.status != OrderStatus.PENDING }
-            else -> orders.filter { it.status.name == filter.name }
-        }
-        filteredList.sortedByDescending { it.completionTimestamp ?: it.acceptedTimestamp ?: 0L }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
-    val balanceSheet = MutableStateFlow(BalanceSheet(tips = 0.0))
-
-    init {
-        if (SessionManager.getAuthToken(application) != null) {
-            loadProfile()
-        }
-    }
-
-    fun setProcessedOrderFilter(filter: ProcessedOrderFilter) {
-        _processedOrderFilter.value = filter
-    }
-
-    fun login(username: String, password: String) {
-        viewModelScope.launch {
-            _isLoading.value = true
-            val result = repository.login(username, password)
-            result.onSuccess { response ->
-                SessionManager.saveSession(getApplication(), response.id, response.token)
-                loadProfile()
-                _uiEvent.emit(UiEvent.LoginSuccess)
-            }.onFailure {
-                _uiEvent.emit(UiEvent.ShowToast("Login failed: ${it.message}"))
-            }
-            _isLoading.value = false
-        }
-    }
-
-    private fun loadProfile() {
-        viewModelScope.launch {
-            _isLoading.value = true
-            repository.getRiderProfile().collect { result ->
-                result.onSuccess { profile ->
-                    _profileState.value = profile
-                }.onFailure {
-                    _uiEvent.emit(UiEvent.ShowToast("Failed to load profile: ${it.message}"))
-                }
-            }
-            _isLoading.value = false
-        }
-    }
-
-    fun toggleAvailability() {
-        val currentProfile = _profileState.value ?: return
-        val oldStatus = currentProfile.isAvailable
-        val newStatus = !oldStatus
-
-        _profileState.value = currentProfile.copy(isAvailable = newStatus)
-
-        viewModelScope.launch {
-            val result = repository.updateRiderStatus(newStatus)
-            result.onSuccess { updatedProfileFromServer ->
-                _profileState.value = updatedProfileFromServer
-                if (updatedProfileFromServer.isAvailable) {
-                    Intent(getApplication(), LocationService::class.java).also {
-                        it.action = LocationService.ACTION_START
-                        getApplication<Application>().startService(it)
-                    }
-                    _uiEvent.emit(UiEvent.ShowToast("You are now online!"))
-                } else {
-                    Intent(getApplication(), LocationService::class.java).also {
-                        it.action = LocationService.ACTION_STOP
-                        getApplication<Application>().startService(it)
-                    }
-                    _uiEvent.emit(UiEvent.ShowToast("You are now offline."))
-                }
-            }.onFailure {
-                _profileState.value = currentProfile.copy(isAvailable = oldStatus)
-                _uiEvent.emit(UiEvent.ShowToast("Failed to update status. Please try again."))
-            }
-        }
-    }
-
-    fun acceptOrder(orderId: String) {
-        viewModelScope.launch {
-            _allOrders.update { currentOrders ->
-                currentOrders.map {
-                    if (it.id == orderId) {
-                        it.copy(status = OrderStatus.ACCEPTED, acceptedTimestamp = System.currentTimeMillis())
-                    } else it
-                }
-            }
-            _uiEvent.emit(UiEvent.ShowToast("Order Accepted!"))
-        }
-    }
-
-    fun completeOrder(orderId: String, additionalTip: Double) {
-        viewModelScope.launch {
-            _allOrders.update { currentOrders ->
-                currentOrders.map {
-                    if (it.id == orderId) {
-                        balanceSheet.update { it.copy(tips = it.tips + additionalTip) }
-                        it.copy(
-                            status = OrderStatus.COMPLETED,
-                            completionTimestamp = System.currentTimeMillis(),
-                            tipAmount = additionalTip
-                        )
-                    } else it
-                }
-            }
-            _uiEvent.emit(UiEvent.ShowToast("Order Marked as Completed."))
-        }
-    }
-
-    fun abortOrder(orderId: String) {
-        viewModelScope.launch {
-            _allOrders.update { currentOrders ->
-                currentOrders.map {
-                    if (it.id == orderId) it.copy(status = OrderStatus.REJECTED, completionTimestamp = System.currentTimeMillis()) else it
-                }
-            }
-            _uiEvent.emit(UiEvent.ShowToast("Order Aborted."))
-        }
-    }
-
-    fun logout() {
-        SessionManager.clearSession(getApplication())
-        _profileState.value = null
-        Intent(getApplication(), LocationService::class.java).also {
-            it.action = LocationService.ACTION_STOP
-            getApplication<Application>().startService(it)
-        }
-    }
-
-    suspend fun updateProfile(name: String, vehicleModel: String, vehicleNumber: String, drivingLicense: String, imageUri: Uri?): Boolean {
-        _isLoading.value = true
-        val result = repository.updateRiderProfile(name, vehicleModel, vehicleNumber, drivingLicense, imageUri)
-        var success = false
-        result.onSuccess { updatedProfile ->
-            _profileState.value = updatedProfile
-            _uiEvent.emit(UiEvent.ShowToast("Profile Updated Successfully!"))
-            success = true
-        }.onFailure {
-            _uiEvent.emit(UiEvent.ShowToast("Failed to update profile: ${it.message}"))
-        }
-        _isLoading.value = false
-        return success
-    }
-}
-
-class RiderViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
+// --- ViewModel Factory ---
+class DeliveryViewModelFactory(private val apiService: ApiService) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
-        if (modelClass.isAssignableFrom(RiderViewModel::class.java)) {
+        if (modelClass.isAssignableFrom(DeliveryViewModel::class.java)) {
             @Suppress("UNCHECKED_CAST")
-            return RiderViewModel(application) as T
+            return DeliveryViewModel(apiService) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class")
     }
 }
 
-sealed class UiEvent {
-    data class ShowToast(val message: String) : UiEvent()
-    object LoginSuccess : UiEvent()
-    object NavigateToOrders : UiEvent()
-}
-// endregion
-
-// region UI Layer
-private val PrimaryRed = Color(0xFFE53935)
-private val DarkGray = Color(0xFF424242)
-private val SurfaceGrey = Color(0xFFF5F5F5)
-private val LightGray = Color(0xFFBDBDBD)
-private val GreenAccept = Color(0xFF4CAF50)
-private val PurpleAccept = Color(0xFF673AB7)
-private val OrangeAccepted = Color(0xFFFFA726)
-
-private val AppColorScheme = lightColorScheme(
-    primary = PrimaryRed,
-    onPrimary = Color.White,
-    secondary = DarkGray,
-    onSecondary = Color.White,
-    background = Color(0xFFFAFAFA),
-    onBackground = DarkGray,
-    surface = Color.White,
-    onSurface = DarkGray,
-    surfaceVariant = SurfaceGrey
-)
-
-@Composable
-fun HoneyRiderTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = AppColorScheme,
-        typography = Typography(
-            headlineLarge = MaterialTheme.typography.headlineLarge.copy(fontWeight = FontWeight.Bold),
-            titleLarge = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-            bodyLarge = MaterialTheme.typography.bodyLarge.copy(lineHeight = 24.sp)
-        ),
-        shapes = Shapes(
-            small = RoundedCornerShape(8.dp),
-            medium = RoundedCornerShape(16.dp),
-            large = RoundedCornerShape(24.dp)
-        ),
-        content = content
-    )
-}
-
-object AppRoutes {
-    const val LOGIN = "login"
-    const val HOME = "home"
-    const val ORDERS = "orders"
-    const val PROFILE = "profile"
-    const val EDIT_PROFILE = "edit_profile"
-}
-
-@Composable
-fun MainScreen(riderViewModel: RiderViewModel) {
-    val navController = rememberNavController()
-    val navBackStackEntry by navController.currentBackStackEntryAsState()
-    val currentRoute = navBackStackEntry?.destination?.route
-
-    val bottomNavRoutes = setOf(AppRoutes.HOME, AppRoutes.ORDERS, AppRoutes.PROFILE)
-    val shouldShowBottomBar = currentRoute in bottomNavRoutes
-
-    Scaffold(
-        bottomBar = {
-            if (shouldShowBottomBar) {
-                AppBottomNavigation(navController = navController)
-            }
-        },
-        floatingActionButton = {
-            if (currentRoute == AppRoutes.PROFILE) {
-                FloatingActionButton(onClick = { navController.navigate(AppRoutes.EDIT_PROFILE) }) {
-                    Icon(Icons.Default.Edit, "Edit Profile")
-                }
-            }
-        }
-    ) { innerPadding ->
-        AppNavigation(
-            navController = navController,
-            riderViewModel = riderViewModel,
-            paddingValues = innerPadding
-        )
-    }
-}
-
-@Composable
-fun AppNavigation(navController: NavHostController, riderViewModel: RiderViewModel, paddingValues: PaddingValues) {
-    val startDestination = if (SessionManager.getAuthToken(LocalContext.current) != null) AppRoutes.HOME else AppRoutes.LOGIN
-    NavHost(
-        navController = navController,
-        startDestination = startDestination,
-        modifier = Modifier.padding(paddingValues)
-    ) {
-        composable(AppRoutes.LOGIN) {
-            LoginScreen(navController = navController, riderViewModel = riderViewModel)
-        }
-        composable(AppRoutes.HOME) {
-            HomeScreen(navController = navController, viewModel = riderViewModel)
-        }
-        composable(AppRoutes.ORDERS) {
-            OrdersScreen(viewModel = riderViewModel)
-        }
-        composable(AppRoutes.PROFILE) {
-            ProfileScreen(navController = navController, viewModel = riderViewModel)
-        }
-        composable(AppRoutes.EDIT_PROFILE) {
-            EditProfileScreen(navController = navController, viewModel = riderViewModel)
-        }
-    }
-}
-
-@Composable
-fun AppBottomNavigation(navController: NavController) {
-    val navBackStackEntry by navController.currentBackStackEntryAsState()
-    val currentRoute = navBackStackEntry?.destination?.route
-
-    val items = listOf(
-        AppRoutes.HOME to Icons.Default.Home,
-        AppRoutes.ORDERS to Icons.AutoMirrored.Filled.ReceiptLong,
-        AppRoutes.PROFILE to Icons.Default.Person
-    )
-
-    NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
-        items.forEach { (route, icon) ->
-            val label = route.replaceFirstChar { it.titlecase() }
-            NavigationBarItem(
-                selected = currentRoute == route,
-                onClick = {
-                    navController.navigate(route) {
-                        popUpTo(navController.graph.startDestinationId) {
-                            saveState = true
-                        }
-                        launchSingleTop = true
-                        restoreState = true
-                    }
-                },
-                icon = { Icon(icon, contentDescription = label) },
-                label = { Text(label) }
-            )
-        }
-    }
-}
-
-@Composable
-fun LoginScreen(navController: NavController, riderViewModel: RiderViewModel) {
-    val context = LocalContext.current
-    val isLoading by riderViewModel.isLoading.collectAsState()
-
-    LaunchedEffect(Unit) {
-        riderViewModel.uiEvent.collect { event ->
-            when (event) {
-                is UiEvent.ShowToast -> Toast.makeText(context, event.message, Toast.LENGTH_SHORT).show()
-                is UiEvent.LoginSuccess -> {
-                    Toast.makeText(context, "Login Successful!", Toast.LENGTH_SHORT).show()
-                    navController.navigate(AppRoutes.HOME) {
-                        popUpTo(AppRoutes.LOGIN) { inclusive = true }
-                    }
-                }
-                else -> {}
-            }
-        }
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp)
-            .statusBarsPadding()
-            .navigationBarsPadding(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        var username by remember { mutableStateOf("") }
-        var password by remember { mutableStateOf("") }
-
-        Icon(Icons.Default.TwoWheeler, "Rider Icon", modifier = Modifier.size(80.dp), tint = PrimaryRed)
-        Spacer(Modifier.height(16.dp))
-        Text("Rider Login", style = MaterialTheme.typography.headlineMedium)
-        Spacer(Modifier.height(32.dp))
-        OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("Username") }, modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(16.dp))
-        OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("Password") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(24.dp))
-
-        if (isLoading) {
-            CircularProgressIndicator()
-        } else {
-            Button(
-                onClick = {
-                    if (username.isNotBlank() && password.isNotBlank()) {
-                        riderViewModel.login(username, password)
-                    } else {
-                        Toast.makeText(context, "Please enter username and password", Toast.LENGTH_SHORT).show()
-                    }
-                },
-                modifier = Modifier.fillMaxWidth().height(56.dp)
-            ) { Text("Login") }
-        }
-    }
-}
-
-@Composable
-fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
-    val context = LocalContext.current
-    val profile by viewModel.profileState.collectAsState()
-    val pendingOrders by viewModel.pendingOrders.collectAsState()
-
-    val locationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestMultiplePermissions(),
-        onResult = { permissions ->
-            if (permissions.getOrDefault(Manifest.permission.ACCESS_FINE_LOCATION, false)) {
-                viewModel.toggleAvailability()
-            } else {
-                Toast.makeText(context, "Location permission is required to go online.", Toast.LENGTH_LONG).show()
-            }
-        }
-    )
-
-    fun handleStatusChangeClick() {
-        val shouldGoOnline = !(profile?.isAvailable ?: false)
-        if (shouldGoOnline) {
-            val hasPermission = ActivityCompat.checkSelfPermission(
-                context, Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-
-            if (!hasPermission) {
-                locationPermissionLauncher.launch(
-                    arrayOf(
-                        Manifest.permission.ACCESS_FINE_LOCATION,
-                        Manifest.permission.ACCESS_COARSE_LOCATION
-                    )
-                )
-            } else {
-                viewModel.toggleAvailability()
-            }
-        } else {
-            viewModel.toggleAvailability()
-        }
-    }
-
-    LaunchedEffect(Unit) {
-        viewModel.uiEvent.collect { event ->
-            if (event is UiEvent.ShowToast) {
-                Toast.makeText(context, event.message, Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
-
-    Scaffold(
-        topBar = {
-            profile?.let {
-                HomeTopBar(
-                    profile = it,
-                    onStatusChangeClick = { handleStatusChangeClick() },
-                    onProfileClick = { navController.navigate(AppRoutes.PROFILE) }
-                )
-            }
-        }
-    ) { padding ->
-        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-            if (profile?.isAvailable == false) {
-                EmptyState(message = "You are currently offline. Go online to receive new order requests.")
-            } else if (pendingOrders.isEmpty()) {
-                EmptyState(message = "No new orders right now. We'll notify you!")
-            } else {
-                LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    items(pendingOrders) { order ->
-                        OrderRequestCard(
-                            order = order,
-                            onAccept = { viewModel.acceptOrder(order.id) },
-                            onDeny = { viewModel.abortOrder(order.id) }
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun OrdersScreen(viewModel: RiderViewModel) {
-    val allOrders by viewModel.allOrders.collectAsState()
-    val processedOrders by viewModel.processedOrders.collectAsState()
-    val balanceSheet by viewModel.balanceSheet.collectAsState()
-    val selectedFilter by viewModel.processedOrderFilter.collectAsState()
-
-    var showFilterMenu by remember { mutableStateOf(false) }
-    var orderForConfirmation by remember { mutableStateOf<Pair<String, String>?>(null) }
-    var orderForCollection by remember { mutableStateOf<Order?>(null) }
-
-    if (orderForConfirmation != null) {
-        val (action, orderId) = orderForConfirmation!!
-        ConfirmationDialog(
-            action = action,
-            onConfirm = {
-                if (action == "Abort") {
-                    viewModel.abortOrder(orderId)
-                } else {
-                    orderForCollection = allOrders.find { it.id == orderId }
-                }
-                orderForConfirmation = null
-            },
-            onDismiss = { orderForConfirmation = null }
-        )
-    }
-
-    if (orderForCollection != null) {
-        AmountCollectionDialog(
-            order = orderForCollection!!,
-            onDismiss = { orderForCollection = null },
-            onSubmit = { collectedAmount ->
-                val order = orderForCollection!!
-                val change = collectedAmount - order.cashToCollect
-                val tip = if (change > 0) change else 0.0
-                viewModel.completeOrder(order.id, tip)
-                orderForCollection = null
-            }
-        )
-    }
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Order History & Tips") },
-                actions = {
-                    Box {
-                        IconButton(onClick = { showFilterMenu = true }) { Icon(Icons.Default.FilterList, contentDescription = "Filter Orders") }
-                        DropdownMenu(expanded = showFilterMenu, onDismissRequest = { showFilterMenu = false }) {
-                            DropdownMenuItem(text = { Text("All") }, onClick = { viewModel.setProcessedOrderFilter(ProcessedOrderFilter.ALL); showFilterMenu = false })
-                            DropdownMenuItem(text = { Text("Accepted") }, onClick = { viewModel.setProcessedOrderFilter(ProcessedOrderFilter.ACCEPTED); showFilterMenu = false })
-                            DropdownMenuItem(text = { Text("Completed") }, onClick = { viewModel.setProcessedOrderFilter(ProcessedOrderFilter.COMPLETED); showFilterMenu = false })
-                            DropdownMenuItem(text = { Text("Aborted") }, onClick = { viewModel.setProcessedOrderFilter(ProcessedOrderFilter.REJECTED); showFilterMenu = false })
-                        }
-                    }
-                },
-                windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
-            )
-        }
-    ) { padding ->
-        LazyColumn(
-            modifier = Modifier.padding(padding).fillMaxSize(),
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            item { BalanceSheetCard(balance = balanceSheet) }
-            item {
-                val filterText = when (selectedFilter) {
-                    ProcessedOrderFilter.ALL -> "All"
-                    ProcessedOrderFilter.REJECTED -> "Aborted"
-                    else -> selectedFilter.name.lowercase().replaceFirstChar { it.titlecase() }
-                }
-                Text("Orders ($filterText)", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp))
-            }
-
-            if (processedOrders.isEmpty()) {
-                item { EmptyState(message = "No orders found for this filter.") }
-            } else {
-                items(processedOrders) { order ->
-                    ProcessedOrderCard(
-                        order = order,
-                        onEndOrder = { orderForConfirmation = "End" to order.id },
-                        onAbortOrder = { orderForConfirmation = "Abort" to order.id }
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun ConfirmationDialog(action: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Confirm Action") },
-        text = { Text("Are you sure you want to '$action' this order?") },
-        confirmButton = {
-            Button(
-                onClick = onConfirm,
-                colors = ButtonDefaults.buttonColors(containerColor = if (action == "Abort") PrimaryRed else GreenAccept)
-            ) { Text("Yes, $action") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
-    )
-}
-
-@Composable
-fun AmountCollectionDialog(order: Order, onDismiss: () -> Unit, onSubmit: (Double) -> Unit) {
-    var amountText by remember { mutableStateOf("") }
-
-    val collectedAmount = amountText.toDoubleOrNull() ?: 0.0
-    val isAmountSufficient = collectedAmount >= order.cashToCollect
-    val change = collectedAmount - order.cashToCollect
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Collect Payment") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Please collect ₹%.2f".format(order.cashToCollect), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                OutlinedTextField(
-                    value = amountText,
-                    onValueChange = { amountText = it.filter { char -> char.isDigit() || char == '.' } },
-                    label = { Text("Amount Received") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    isError = !isAmountSufficient && amountText.isNotEmpty()
-                )
-                if (!isAmountSufficient && amountText.isNotEmpty()) {
-                    Text("Insufficient amount", color = MaterialTheme.colorScheme.error)
-                }
-                if (isAmountSufficient && change > 0) {
-                    Text("Change to give back: ₹%.2f".format(change), color = GreenAccept)
-                    Text(
-                        "Note: Extra amount of ₹%.2f will be added as a tip.".format(change),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.Gray
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = { onSubmit(collectedAmount) },
-                enabled = isAmountSufficient
-            ) { Text("Submit") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
-    )
-}
-
-@Composable
-fun BalanceSheetCard(balance: BalanceSheet) {
-    Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(4.dp)) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Your Tips", style = MaterialTheme.typography.headlineSmall)
-            Divider()
-            BalanceRow("Tips Collected", balance.tips)
-        }
-    }
-}
-
-@Composable
-fun BalanceRow(label: String, amount: Double) {
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(text = label, style = MaterialTheme.typography.bodyLarge)
-        Text(text = "₹%.2f".format(amount), style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
-    }
-}
-
-@Composable
-fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () -> Unit) {
-    var isExpanded by remember { mutableStateOf(false) }
-    val rotationAngle by animateFloatAsState(targetValue = if (isExpanded) 180f else 0f, label = "expansion_arrow")
-
-    val cardColors = when (order.status) {
-        OrderStatus.COMPLETED -> CardDefaults.cardColors(containerColor = GreenAccept, contentColor = Color.White)
-        OrderStatus.ACCEPTED -> CardDefaults.cardColors(containerColor = OrangeAccepted, contentColor = DarkGray)
-        OrderStatus.REJECTED -> CardDefaults.cardColors(containerColor = PrimaryRed, contentColor = Color.White)
-        else -> CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-    }
-
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable { isExpanded = !isExpanded },
-        colors = cardColors
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(order.restaurantName, fontWeight = FontWeight.Bold)
-                    Text("Order #${order.id}", style = MaterialTheme.typography.bodySmall)
-                }
-                if (order.status == OrderStatus.ACCEPTED) {
-                    OrderTimer(acceptedTimestamp = order.acceptedTimestamp, timeLimitMinutes = order.timeLimitMinutes)
-                } else if (order.completionTimestamp != null && order.acceptedTimestamp != null) {
-                    val timeTaken = order.completionTimestamp - order.acceptedTimestamp
-                    val minutes = TimeUnit.MILLISECONDS.toMinutes(timeTaken)
-                    val seconds = TimeUnit.MILLISECONDS.toSeconds(timeTaken) % 60
-                    Text(text = "Took ${minutes}m ${seconds}s", style = MaterialTheme.typography.bodySmall, color = LocalContentColor.current.copy(alpha = 0.8f), modifier = Modifier.padding(horizontal = 8.dp))
-                }
-                OrderStatusChip(status = order.status)
-                Icon(imageVector = Icons.Default.KeyboardArrowDown, contentDescription = "Expand", modifier = Modifier.rotate(rotationAngle))
-            }
-
-            AnimatedVisibility(visible = isExpanded) {
-                Column(modifier = Modifier.padding(top = 16.dp)) {
-                    Divider(color = LocalContentColor.current.copy(alpha = 0.3f))
-                    Spacer(Modifier.height(12.dp))
-                    OrderDetailRow(icon = Icons.Default.Store, label = "Pickup", value = order.pickupAddress)
-                    OrderDetailRow(icon = Icons.Default.Home, label = "Delivery", value = order.deliveryAddress)
-                    OrderDetailRow(icon = Icons.Default.ShoppingBag, label = "Items", value = "${order.itemCount} Items")
-                    Divider(modifier = Modifier.padding(vertical = 12.dp), color = LocalContentColor.current.copy(alpha = 0.3f))
-                    OrderDetailRow(icon = Icons.Default.Receipt, label = "Order Total", value = "₹%.2f".format(order.orderTotal))
-                    OrderDetailRow(icon = Icons.Default.TwoWheeler, label = "Delivery Charge", value = "₹%.2f".format(order.deliveryCharge))
-                    OrderDetailRow(icon = Icons.Default.FlashOn, label = "Surge Charge", value = "₹%.2f".format(order.surgeCharge))
-                    OrderDetailRow(icon = Icons.Default.Payments, label = "Amount to Collect", value = "₹%.2f".format(order.cashToCollect), isHighlight = true)
-                    Divider(modifier = Modifier.padding(vertical = 12.dp), color = LocalContentColor.current.copy(alpha = 0.3f))
-                    if (order.tipAmount > 0) {
-                        OrderDetailRow(icon = Icons.Default.Favorite, label = "Tip Received", value = "₹%.2f".format(order.tipAmount))
-                    }
-                }
-            }
-
-            if (order.status == OrderStatus.ACCEPTED) {
-                Spacer(Modifier.height(16.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onAbortOrder, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.errorContainer)) { Text("Abort Order") }
-                    Button(onClick = onEndOrder, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary)) { Text("End Order") }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun OrderTimer(acceptedTimestamp: Long?, timeLimitMinutes: Int) {
-    if (acceptedTimestamp == null) return
-
-    var remainingTime by remember { mutableStateOf(0L) }
-
-    LaunchedEffect(key1 = acceptedTimestamp) {
-        while (true) {
-            val elapsedMillis = System.currentTimeMillis() - acceptedTimestamp
-            remainingTime = TimeUnit.MINUTES.toMillis(timeLimitMinutes.toLong()) - elapsedMillis
-            delay(1000)
-        }
-    }
-
-    val isOvertime = remainingTime < 0
-    val absRemainingTime = abs(remainingTime)
-
-    val minutes = TimeUnit.MILLISECONDS.toMinutes(absRemainingTime)
-    val seconds = TimeUnit.MILLISECONDS.toSeconds(absRemainingTime) % 60
-
-    val timeString = String.format("%s%02d:%02d", if (isOvertime) "-" else "", minutes, seconds)
-    val color = if (isOvertime) PrimaryRed else if (LocalContentColor.current == Color.White) Color.White else GreenAccept
-
-    Text(text = timeString, color = color, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp))
-}
-
-@Composable
-fun OrderDetailRow(icon: ImageVector, label: String, value: String, isHighlight: Boolean = false) {
-    val contentColor = LocalContentColor.current
-    Row(modifier = Modifier.padding(vertical = 4.dp), verticalAlignment = Alignment.Top) {
-        Icon(imageVector = icon, contentDescription = label, modifier = Modifier.size(20.dp), tint = if (isHighlight) PrimaryRed else contentColor.copy(alpha = 0.7f))
-        Spacer(Modifier.width(16.dp))
-        Column {
-            Text(label, style = MaterialTheme.typography.labelMedium, color = contentColor.copy(alpha = 0.7f))
-            Text(text = value, style = MaterialTheme.typography.bodyLarge, fontWeight = if (isHighlight) FontWeight.Bold else FontWeight.Normal, color = if (isHighlight) PrimaryRed else contentColor)
-        }
-    }
-}
-
-@Composable
-fun OrderStatusChip(status: OrderStatus) {
-    val (text, bgColor) = when (status) {
-        OrderStatus.ACCEPTED -> "Accepted" to DarkGray
-        OrderStatus.REJECTED -> "Aborted" to PrimaryRed
-        OrderStatus.COMPLETED -> "Completed" to DarkGray
-        else -> status.name to LightGray
-    }
-    Text(text = text, color = Color.White, modifier = Modifier.background(bgColor, RoundedCornerShape(50)).padding(horizontal = 12.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium)
-}
-
-@Composable
-fun HomeTopBar(profile: RiderProfile, onStatusChangeClick: () -> Unit, onProfileClick: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(16.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Column(modifier = Modifier.weight(1f, fill = false)) {
-            Text(
-                text = profile.name,
-                style = MaterialTheme.typography.titleLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Text(
-                text = profile.vehicleNumber,
-                style = MaterialTheme.typography.bodyMedium,
-                color = LightGray
-            )
-        }
-        Row(
-            modifier = Modifier.padding(start = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            AvailabilityIndicator(isAvailable = profile.isAvailable, onClick = onStatusChangeClick)
-            val placeholderPainter = rememberVectorPainter(image = Icons.Default.AccountCircle)
-            AsyncImage(model = profile.imageUrl, contentDescription = "Rider Profile", modifier = Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onProfileClick), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
-        }
-    }
-}
-
-@Composable
-fun AvailabilityIndicator(isAvailable: Boolean, onClick: () -> Unit) {
-    val (text, color, icon) = if (isAvailable) Triple("Online", GreenAccept, Icons.Default.CheckCircle) else Triple("Offline", Color.Gray, Icons.Default.Cancel)
-    Card(shape = CircleShape, colors = CardDefaults.cardColors(containerColor = color), modifier = Modifier.clickable(onClick = onClick)) {
-        Row(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
-            Text(text, color = Color.White, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-        }
-    }
-}
-
-@Composable
-fun OrderRequestCard(order: Order, onAccept: () -> Unit, onDeny: () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(4.dp), shape = MaterialTheme.shapes.medium) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text("New Order Request!", style = MaterialTheme.typography.labelMedium, color = PrimaryRed)
-            Text(order.restaurantName, style = MaterialTheme.typography.titleLarge)
-            Text(order.pickupAddress, style = MaterialTheme.typography.bodyMedium)
-            Divider(modifier = Modifier.padding(vertical = 12.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                InfoColumn("Pickup", order.pickupAddress)
-                InfoColumn("Drop", order.deliveryAddress, alignEnd = true)
-            }
-            Divider(modifier = Modifier.padding(vertical = 12.dp))
-            Spacer(Modifier.height(16.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                Button(
-                    onClick = onDeny,
-                    modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryRed)
-                ) { Text("Deny") }
-                Button(
-                    onClick = onAccept,
-                    modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColors(containerColor = PurpleAccept)
-                ) { Text("Accept") }
-            }
-        }
-    }
-}
-
-@Composable
-fun InfoColumn(label: String, value: String, alignEnd: Boolean = false) {
-    Column(horizontalAlignment = if (alignEnd) Alignment.End else Alignment.Start, modifier = Modifier.widthIn(max = 150.dp)) {
-        Text(label, style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-        Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, textAlign = if (alignEnd) TextAlign.End else TextAlign.Start, maxLines = 2, overflow = TextOverflow.Ellipsis)
-    }
-}
-
-@Composable
-fun EmptyState(message: String) {
-    Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-        Text(text = message, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun ProfileScreen(navController: NavController, viewModel: RiderViewModel) {
-    val profile by viewModel.profileState.collectAsState()
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("My Profile") },
-                windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
-            )
-        }
-    ) { padding ->
-        profile?.let {
-            Column(
-                modifier = Modifier
-                    .padding(padding)
-                    .fillMaxSize()
-                    .padding(16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                val placeholderPainter = rememberVectorPainter(image = Icons.Default.AccountCircle)
-                AsyncImage(model = it.imageUrl, contentDescription = "Profile Picture", modifier = Modifier.size(120.dp).clip(CircleShape), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
-                Text(it.name, style = MaterialTheme.typography.headlineSmall)
-                Text("@${it.username}", style = MaterialTheme.typography.titleMedium, color = Color.Gray)
-                Divider()
-                ProfileInfoRow(icon = Icons.Default.TwoWheeler, label = "Vehicle Model", value = it.vehicleModel)
-                ProfileInfoRow(icon = Icons.Default.ConfirmationNumber, label = "Vehicle Number", value = it.vehicleNumber)
-                ProfileInfoRow(icon = Icons.Default.CardMembership, label = "Driving License", value = it.drivingLicense)
-                Spacer(Modifier.weight(1f))
-                Button(onClick = { viewModel.logout(); navController.navigate(AppRoutes.LOGIN) { popUpTo(0) { inclusive = true } } }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Logout") }
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun EditProfileScreen(navController: NavController, viewModel: RiderViewModel) {
-    val profile by viewModel.profileState.collectAsState()
-    val scope = rememberCoroutineScope()
-    var name by remember(profile) { mutableStateOf(profile?.name ?: "") }
-    var vehicleModel by remember(profile) { mutableStateOf(profile?.vehicleModel ?: "") }
-    var vehicleNumber by remember(profile) { mutableStateOf(profile?.vehicleNumber ?: "") }
-    var drivingLicense by remember(profile) { mutableStateOf(profile?.drivingLicense ?: "") }
-    var imageUri by remember { mutableStateOf<Uri?>(null) }
-
-    val imagePickerLauncher = rememberLauncherForActivityResult(contract = ActivityResultContracts.GetContent()) { uri: Uri? -> imageUri = uri }
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Edit Profile") },
-                navigationIcon = { IconButton(onClick = { navController.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
-                actions = {
-                    IconButton(onClick = {
-                        scope.launch {
-                            if (viewModel.updateProfile(name, vehicleModel, vehicleNumber, drivingLicense, imageUri)) {
-                                navController.popBackStack()
-                            }
-                        }
-                    }) {
-                        Icon(Icons.Default.Save, "Save")
-                    }
-                },
-                windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
-            )
-        }
-    ) { padding ->
-        LazyColumn(modifier = Modifier.padding(padding).fillMaxSize(), contentPadding = PaddingValues(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            item {
-                Box(modifier = Modifier.size(120.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant).clickable { imagePickerLauncher.launch("image/*") }, contentAlignment = Alignment.Center) {
-                    val placeholderPainter = rememberVectorPainter(image = Icons.Default.AccountCircle)
-                    AsyncImage(model = imageUri ?: profile?.imageUrl, contentDescription = "Profile Image", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
-                    Icon(Icons.Default.Edit, "Edit", tint = Color.White.copy(alpha = 0.7f))
-                }
-            }
-            item { OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Full Name") }, modifier = Modifier.fillMaxWidth()) }
-            item { OutlinedTextField(value = vehicleModel, onValueChange = { vehicleModel = it }, label = { Text("Vehicle Model") }, modifier = Modifier.fillMaxWidth()) }
-            item { OutlinedTextField(value = vehicleNumber, onValueChange = { vehicleNumber = it }, label = { Text("Vehicle Number") }, modifier = Modifier.fillMaxWidth()) }
-            item { OutlinedTextField(value = drivingLicense, onValueChange = { drivingLicense = it }, label = { Text("Driving License") }, modifier = Modifier.fillMaxWidth()) }
-        }
-    }
-}
-
-@Composable
-fun ProfileInfoRow(icon: ImageVector, label: String, value: String) {
-    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        Icon(icon, contentDescription = label, tint = PrimaryRed, modifier = Modifier.size(24.dp))
-        Spacer(Modifier.width(16.dp))
-        Column {
-            Text(label, style = MaterialTheme.typography.labelMedium, color = Color.Gray)
-            Text(value, style = MaterialTheme.typography.bodyLarge)
-        }
-    }
-}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val riderViewModel: RiderViewModel by viewModels { RiderViewModelFactory(application) }
+        // Dummy ApiService instance for demonstration.
+        // In a real app, this would be provided by a dependency injection framework like Hilt.
+        val apiService = object : ApiService {
+            // Mock implementations for testing UI
+            override suspend fun getDeliveryDetails(orderId: Long): RiderDeliveryDetails {
+                return RiderDeliveryDetails(
+                    orderId = 101, status = "RIDER_ASSIGNED",
+                    vendorName = "Gourmet Kitchen", vendorAddress = "123 Food Street, Bhimavaram",
+                    vendorLatitude = 16.5449, vendorLongitude = 81.5212,
+                    customerAddress = "456 Home Avenue, Bhimavaram",
+                    customerLatitude = 16.533, customerLongitude = 81.522,
+                    pickupOtp = "1234"
+                )
+            }
+            override suspend fun confirmPickup(orderId: Long, otp: String) {
+                // No-op for mock
+            }
+        }
+
         setContent {
             HoneyRiderTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    MainScreen(riderViewModel = riderViewModel)
+                    // Pass a sample orderId for demonstration
+                    ActiveDeliveryScreen(
+                        orderId = 101L,
+                        viewModel = viewModel(factory = DeliveryViewModelFactory(apiService))
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ActiveDeliveryScreen(orderId: Long, viewModel: DeliveryViewModel) {
+    val deliveryDetails by viewModel.deliveryDetails.collectAsStateWithLifecycle()
+    val isPickupConfirmed by viewModel.isPickupConfirmed.collectAsStateWithLifecycle()
+
+    LaunchedEffect(orderId) {
+        viewModel.loadDeliveryDetails(orderId)
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(title = { Text("Active Delivery") })
+        }
+    ) { padding ->
+        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+            if (deliveryDetails == null) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else {
+                AnimatedContent(targetState = isPickupConfirmed, label = "DeliveryStepAnimation") { confirmed ->
+                    if (!confirmed) {
+                        PickupStep(details = deliveryDetails!!, viewModel = viewModel)
+                    } else {
+                        DeliveryStep(details = deliveryDetails!!)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PickupStep(details: RiderDeliveryDetails, viewModel: DeliveryViewModel) {
+    val context = LocalContext.current
+    var enteredOtp by remember { mutableStateOf("") }
+
+    val vendorLocation = LatLng(details.vendorLatitude, details.vendorLongitude)
+    val cameraPositionState = rememberCameraPositionState {
+        position = CameraPosition.fromLatLngZoom(vendorLocation, 15f)
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        GoogleMap(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            cameraPositionState = cameraPositionState
+        ) {
+            Marker(state = MarkerState(position = vendorLocation), title = "Pickup Location", snippet = details.vendorName)
+        }
+
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("Head to Vendor", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Text(details.vendorName, style = MaterialTheme.typography.titleLarge)
+            Text(details.vendorAddress, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(16.dp))
+            Text("Confirmation OTP", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text(
+                details.pickupOtp ?: "N/A",
+                style = MaterialTheme.typography.displayMedium,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 8.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(vertical = 8.dp).fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = enteredOtp,
+                onValueChange = { if (it.length <= 4) enteredOtp = it },
+                label = { Text("Enter OTP from Vendor") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Button(
+                onClick = {
+                    viewModel.confirmPickup(details.orderId, enteredOtp) { success ->
+                        if (!success) {
+                            Toast.makeText(context, "Invalid OTP. Please try again.", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                },
+                modifier = Modifier.padding(top = 16.dp).fillMaxWidth().height(50.dp),
+                enabled = enteredOtp.length == 4
+            ) {
+                Text("Confirm Pickup")
+            }
+        }
+    }
+}
+
+@Composable
+fun DeliveryStep(details: RiderDeliveryDetails) {
+    val vendorLocation = LatLng(details.vendorLatitude, details.vendorLongitude)
+    val customerLocation = LatLng(details.customerLatitude, details.customerLongitude)
+    val cameraPositionState = rememberCameraPositionState {
+        position = CameraPosition.fromLatLngZoom(customerLocation, 15f)
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        GoogleMap(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            cameraPositionState = cameraPositionState
+        ) {
+            Marker(state = MarkerState(position = vendorLocation), title = "Pickup Location")
+            Marker(state = MarkerState(position = customerLocation), title = "Delivery Destination")
+        }
+
+        Card(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("Deliver To", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                Text(details.customerAddress, style = MaterialTheme.typography.titleLarge)
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    onClick = { /* TODO: Call viewModel.markAsDelivered() */ },
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                ) {
+                    Text("Mark as Delivered")
                 }
             }
         }

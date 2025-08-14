@@ -72,6 +72,17 @@ dependencies {
     implementation(libs.coil.compose)
     implementation(libs.play.services.location.v2120)
 
+    implementation(libs.maps.compose)
+    implementation(libs.play.services.maps)
+
+    // Lifecycle extensions for collecting StateFlow safely
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.compose.v282)
+
+    // Compose Animation
+    implementation(libs.androidx.animation)
+
+
     // Testing libraries
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
