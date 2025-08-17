@@ -55,14 +55,27 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import coil.compose.AsyncImage
+import com.google.gson.Gson
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.Body
+import retrofit2.http.GET
+import retrofit2.http.Multipart
+import retrofit2.http.PUT
+import retrofit2.http.Part
+import retrofit2.http.Path
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 // ================================================================================
-// 1. DATA LAYER (MODELS, REPOSITORY, SESSION MANAGER)
+// 1. DATA LAYER (MODELS, API, REPOSITORY, SESSION MANAGER)
 // ================================================================================
 
 data class RiderProfile(
@@ -94,7 +107,6 @@ data class Order(
         get() = orderTotal + deliveryCharge + surgeCharge
 }
 
-
 data class BalanceSheet(
     val tips: Double
 )
@@ -125,178 +137,285 @@ object SessionManager {
     }
 }
 
+interface ApiService {
+    @GET("api/riders/{id}/profile")
+    suspend fun getRiderProfile(@Path("id") riderId: Long): RiderProfile
 
-object FakeRepository {
-    private val sampleOrders = MutableStateFlow(listOf(
-        Order("ORD-101", "Pizza Junction", "123 MG Road, Koramangala", "456 Indiranagar, 5th Main", OrderStatus.PENDING, 0.0, 3, 5, orderTotal = 750.0, deliveryCharge = 40.0, surgeCharge = 10.0)
-    ))
+    @PUT("api/riders/{id}/availability")
+    suspend fun updateRiderStatus(@Path("id") riderId: Long, @Body isAvailable: Map<String, Boolean>): retrofit2.Response<Unit>
 
-    private val sampleRiders = mutableMapOf(
-        1L to RiderProfile(1L, "rider_one", "Suresh Kumar", "Honda Activa", "AP 39 AB 1234", null, true)
-    )
+    @Multipart
+    @PUT("api/riders/{id}/profile")
+    suspend fun updateRiderProfile(
+        @Path("id") riderId: Long,
+        @Part("name") name: RequestBody,
+        @Part("vehicleModel") vehicleModel: RequestBody,
+        @Part("vehicleNumber") vehicleNumber: RequestBody,
+        @Part image: MultipartBody.Part?
+    ): retrofit2.Response<Unit>
 
-    private val balanceSheet = MutableStateFlow(BalanceSheet(tips = 0.0))
+    @PUT("api/orders/{id}/accept-by-rider")
+    suspend fun acceptOrderByRider(@Path("id") orderId: Long): retrofit2.Response<Unit>
 
+    @PUT("api/orders/{id}/complete-by-rider")
+    suspend fun completeOrderByRider(@Path("id") orderId: Long, @Body tip: Map<String, Double>): retrofit2.Response<Unit>
 
-    val orders: StateFlow<List<Order>> = sampleOrders.asStateFlow()
-    val balance: StateFlow<BalanceSheet> = balanceSheet.asStateFlow()
+    @PUT("api/orders/{id}/abort-by-rider")
+    suspend fun abortOrderByRider(@Path("id") orderId: Long): retrofit2.Response<Unit>
+}
 
-    fun getRiderProfile(riderId: Long): Flow<RiderProfile?> {
-        return flowOf(sampleRiders[riderId])
+object RetrofitClient {
+    private const val BASE_URL = "http://YOUR_BACKEND_IP:8080/"
+
+    val instance: ApiService by lazy {
+        val retrofit = Retrofit.Builder()
+            .baseUrl(BASE_URL)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+        retrofit.create(ApiService::class.java)
     }
+}
 
-    suspend fun updateRiderStatus(riderId: Long, isAvailable: Boolean) {
-        delay(300)
-        sampleRiders[riderId]?.let {
-            sampleRiders[riderId] = it.copy(isAvailable = isAvailable)
-        }
-    }
 
-    suspend fun updateRiderProfile(riderId: Long, name: String, vehicleModel: String, vehicleNumber: String, imageUri: Uri?): Result<Unit> {
-        delay(1000)
-        val currentProfile = sampleRiders[riderId]
-        if (currentProfile != null) {
-            sampleRiders[riderId] = currentProfile.copy(
-                name = name,
-                vehicleModel = vehicleModel,
-                vehicleNumber = vehicleNumber,
-                imageUrl = imageUri?.toString() ?: currentProfile.imageUrl
-            )
-            return Result.success(Unit)
-        }
-        return Result.failure(Exception("Rider not found"))
-    }
+class RiderRepository(private val apiService: ApiService) {
+    suspend fun getProfile(riderId: Long) = apiService.getRiderProfile(riderId)
+    suspend fun updateStatus(riderId: Long, isAvailable: Boolean) = apiService.updateRiderStatus(riderId, mapOf("isAvailable" to isAvailable))
+    suspend fun acceptOrder(orderId: Long) = apiService.acceptOrderByRider(orderId)
+    suspend fun completeOrder(orderId: Long, tip: Double) = apiService.completeOrderByRider(orderId, mapOf("tip" to tip))
+    suspend fun abortOrder(orderId: Long) = apiService.abortOrderByRider(orderId)
 
-    suspend fun acceptOrder(orderId: String) {
-        sampleOrders.update { currentOrders ->
-            currentOrders.map {
-                if (it.id == orderId) {
-                    it.copy(status = OrderStatus.ACCEPTED, acceptedTimestamp = System.currentTimeMillis())
-                } else it
+    suspend fun updateProfile(riderId: Long, name: String, vehicleModel: String, vehicleNumber: String, imageUri: Uri?, context: Context): Boolean {
+        val nameBody = name.toRequestBody("text/plain".toMediaTypeOrNull())
+        val modelBody = vehicleModel.toRequestBody("text/plain".toMediaTypeOrNull())
+        val numberBody = vehicleNumber.toRequestBody("text/plain".toMediaTypeOrNull())
+
+        var imagePart: MultipartBody.Part? = null
+        if (imageUri != null) {
+            val stream = context.contentResolver.openInputStream(imageUri)
+            val bytes = stream?.readBytes()
+            stream?.close()
+            if (bytes != null) {
+                val requestFile = bytes.toRequestBody("image/*".toMediaTypeOrNull())
+                imagePart = MultipartBody.Part.createFormData("image", "profile.jpg", requestFile)
             }
         }
-    }
-
-    suspend fun completeOrder(orderId: String, additionalTip: Double) {
-        val order = sampleOrders.value.find { it.id == orderId }
-        if (order != null) {
-            balanceSheet.update {
-                it.copy(
-                    tips = it.tips + additionalTip
-                )
-            }
-            sampleOrders.update { currentOrders ->
-                currentOrders.map {
-                    if (it.id == orderId) {
-                        it.copy(
-                            status = OrderStatus.COMPLETED,
-                            completionTimestamp = System.currentTimeMillis(),
-                            tipAmount = additionalTip
-                        )
-                    } else it
-                }
-            }
-        }
-    }
-
-    suspend fun abortOrder(orderId: String) {
-        updateOrderStatus(orderId, OrderStatus.REJECTED)
-    }
-
-    private fun updateOrderStatus(orderId: String, newStatus: OrderStatus) {
-        sampleOrders.update { currentOrders ->
-            currentOrders.map {
-                if (it.id == orderId) it.copy(status = newStatus, completionTimestamp = System.currentTimeMillis()) else it
-            }
-        }
+        val response = apiService.updateRiderProfile(riderId, nameBody, modelBody, numberBody, imagePart)
+        return response.isSuccessful
     }
 }
 
 
 // ================================================================================
-// 2. VIEWMODELS
+// 2. VIEWMODEL
 // ================================================================================
+
+data class RiderUiState(
+    val profile: RiderProfile? = null,
+    val pendingOrders: List<Order> = emptyList(),
+    val processedOrders: List<Order> = emptyList(),
+    val balanceSheet: BalanceSheet = BalanceSheet(0.0),
+    val processedOrderFilter: ProcessedOrderFilter = ProcessedOrderFilter.ALL
+)
 
 enum class ProcessedOrderFilter { ALL, ACCEPTED, COMPLETED, REJECTED }
 
-class RiderViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = FakeRepository
+sealed class UiEvent {
+    data class ShowToast(val message: String) : UiEvent()
+}
+
+class RiderViewModel(
+    application: Application,
+    private val repository: RiderRepository
+) : AndroidViewModel(application) {
+
     private val riderId = SessionManager.getRiderId(application)
 
-    private val _profileState = MutableStateFlow<RiderProfile?>(null)
-    val profileState = _profileState.asStateFlow()
+    private val _uiState = MutableStateFlow(RiderUiState())
+    val uiState: StateFlow<RiderUiState> = _uiState.asStateFlow()
 
-    private val _uiEvent = MutableSharedFlow<UiEvent>()
-    val uiEvent = _uiEvent.asSharedFlow()
+    private val _uiEvent = Channel<UiEvent>()
+    val uiEvent = _uiEvent.receiveAsFlow()
 
-    private val _processedOrderFilter = MutableStateFlow(ProcessedOrderFilter.ALL)
-    val processedOrderFilter = _processedOrderFilter.asStateFlow()
+    private var webSocket: WebSocket? = null
+    private val gson = Gson()
 
-    val pendingOrders = repository.orders.map { orders ->
-        orders.filter { it.status == OrderStatus.PENDING }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
-    val processedOrders = combine(repository.orders, _processedOrderFilter) { orders, filter ->
-        val filteredList = when (filter) {
-            ProcessedOrderFilter.ALL -> orders.filter { it.status != OrderStatus.PENDING }
-            else -> orders.filter { it.status.name == filter.name }
-        }
-        filteredList.sortedByDescending { it.completionTimestamp ?: it.acceptedTimestamp ?: 0L }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
-
-    val balanceSheet = repository.balance.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), BalanceSheet(tips = 0.0))
-
+    private val allProcessedOrders = mutableStateListOf<Order>()
 
     init {
-        loadProfile()
-    }
-
-    fun setProcessedOrderFilter(filter: ProcessedOrderFilter) {
-        _processedOrderFilter.value = filter
-    }
-
-    private fun loadProfile() {
         if (riderId != -1L) {
-            viewModelScope.launch {
-                repository.getRiderProfile(riderId).collect {
-                    _profileState.value = it
-                }
+            fetchProfile()
+            connectToWebSocket()
+        }
+    }
+
+    private fun fetchProfile() {
+        viewModelScope.launch {
+            try {
+                val profile = repository.getProfile(riderId)
+                _uiState.update { it.copy(profile = profile) }
+            } catch (e: Exception) {
+                sendEvent(UiEvent.ShowToast("Failed to load profile"))
             }
         }
     }
 
+    private fun connectToWebSocket() {
+        val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
+        val request = Request.Builder().url("ws://YOUR_BACKEND_IP:8080/ws/orders").build()
+        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val order = gson.fromJson(text, Order::class.java)
+                    _uiState.update {
+                        it.copy(pendingOrders = it.pendingOrders + order)
+                    }
+                } catch (e: Exception) {
+                    // Handle potential JSON parsing errors
+                }
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
+                sendEvent(UiEvent.ShowToast("Connection error. Retrying..."))
+                // Simple retry logic
+                viewModelScope.launch {
+                    delay(5000)
+                    connectToWebSocket()
+                }
+            }
+        })
+        client.dispatcher.executorService.shutdown()
+    }
+
     fun toggleAvailability() {
         viewModelScope.launch {
-            val currentStatus = _profileState.value?.isAvailable ?: return@launch
-            repository.updateRiderStatus(riderId, !currentStatus)
-            loadProfile()
-            _uiEvent.emit(UiEvent.ShowToast(if (!currentStatus) "You are now online!" else "You are now offline."))
+            val currentProfile = _uiState.value.profile ?: return@launch
+            val newAvailability = !currentProfile.isAvailable
+            try {
+                val response = repository.updateStatus(riderId, newAvailability)
+                if (response.isSuccessful) {
+                    _uiState.update { it.copy(profile = currentProfile.copy(isAvailable = newAvailability)) }
+                } else {
+                    sendEvent(UiEvent.ShowToast("Failed to update status"))
+                }
+            } catch (e: Exception) {
+                sendEvent(UiEvent.ShowToast("Network error"))
+            }
         }
     }
 
     fun acceptOrder(orderId: String) {
         viewModelScope.launch {
-            val wasLastOrder = pendingOrders.value.size == 1 && pendingOrders.value.first().id == orderId
-            repository.acceptOrder(orderId)
-            _uiEvent.emit(UiEvent.ShowToast("Order Accepted!"))
-            if (wasLastOrder) {
-                _uiEvent.emit(UiEvent.NavigateToOrders)
+            try {
+                val response = repository.acceptOrder(orderId.toLong())
+                if (response.isSuccessful) {
+                    val acceptedOrder = _uiState.value.pendingOrders.find { it.id == orderId }
+                    if (acceptedOrder != null) {
+                        _uiState.update {
+                            it.copy(
+                                pendingOrders = it.pendingOrders.filter { o -> o.id != orderId }
+                            )
+                        }
+                        allProcessedOrders.add(acceptedOrder.copy(status = OrderStatus.ACCEPTED, acceptedTimestamp = System.currentTimeMillis()))
+                        filterProcessedOrders()
+                        sendEvent(UiEvent.ShowToast("Order Accepted!"))
+                    }
+                } else {
+                    sendEvent(UiEvent.ShowToast("Failed to accept order"))
+                }
+            } catch (e: Exception) {
+                sendEvent(UiEvent.ShowToast("Network error"))
             }
         }
     }
 
-    fun completeOrder(orderId: String, additionalTip: Double) {
+    fun completeOrder(orderId: String, tip: Double) {
         viewModelScope.launch {
-            repository.completeOrder(orderId, additionalTip)
-            _uiEvent.emit(UiEvent.ShowToast("Order Marked as Completed."))
+            try {
+                val response = repository.completeOrder(orderId.toLong(), tip)
+                if(response.isSuccessful) {
+                    updateLocalOrderStatus(orderId, OrderStatus.COMPLETED, tip)
+                    sendEvent(UiEvent.ShowToast("Order Completed!"))
+                } else {
+                    sendEvent(UiEvent.ShowToast("Failed to complete order"))
+                }
+            } catch (e: Exception) {
+                sendEvent(UiEvent.ShowToast("Network error"))
+            }
         }
     }
 
     fun abortOrder(orderId: String) {
         viewModelScope.launch {
-            repository.abortOrder(orderId)
-            _uiEvent.emit(UiEvent.ShowToast("Order Aborted."))
+            try {
+                val response = repository.abortOrder(orderId.toLong())
+                if(response.isSuccessful) {
+                    // Abort from pending list
+                    if (_uiState.value.pendingOrders.any { it.id == orderId }) {
+                        _uiState.update {
+                            it.copy(pendingOrders = it.pendingOrders.filter { o -> o.id != orderId })
+                        }
+                    } else { // Abort from processed (accepted) list
+                        updateLocalOrderStatus(orderId, OrderStatus.REJECTED)
+                    }
+                    sendEvent(UiEvent.ShowToast("Order Aborted"))
+                } else {
+                    sendEvent(UiEvent.ShowToast("Failed to abort order"))
+                }
+            } catch (e: Exception) {
+                sendEvent(UiEvent.ShowToast("Network error"))
+            }
+        }
+    }
+
+
+    fun setProcessedOrderFilter(filter: ProcessedOrderFilter) {
+        _uiState.update { it.copy(processedOrderFilter = filter) }
+        filterProcessedOrders()
+    }
+
+    private fun filterProcessedOrders() {
+        val filter = _uiState.value.processedOrderFilter
+        val filteredList = if (filter == ProcessedOrderFilter.ALL) {
+            allProcessedOrders
+        } else {
+            allProcessedOrders.filter { it.status.name == filter.name }
+        }
+        _uiState.update { it.copy(processedOrders = filteredList.sortedByDescending { o -> o.acceptedTimestamp }) }
+    }
+
+
+    private fun updateLocalOrderStatus(orderId: String, newStatus: OrderStatus, tip: Double = 0.0) {
+        val index = allProcessedOrders.indexOfFirst { it.id == orderId }
+        if (index != -1) {
+            val updatedOrder = allProcessedOrders[index].copy(
+                status = newStatus,
+                completionTimestamp = System.currentTimeMillis(),
+                tipAmount = tip
+            )
+            allProcessedOrders[index] = updatedOrder
+
+            if(newStatus == OrderStatus.COMPLETED) {
+                _uiState.update {
+                    it.copy(balanceSheet = it.balanceSheet.copy(tips = it.balanceSheet.tips + tip))
+                }
+            }
+            filterProcessedOrders()
+        }
+    }
+
+    suspend fun updateProfile(name: String, vehicleModel: String, vehicleNumber: String, imageUri: Uri?): Boolean {
+        return try {
+            val success = repository.updateProfile(riderId, name, vehicleModel, vehicleNumber, imageUri, getApplication())
+            if(success) {
+                fetchProfile()
+                sendEvent(UiEvent.ShowToast("Profile Updated!"))
+            } else {
+                sendEvent(UiEvent.ShowToast("Profile update failed"))
+            }
+            success
+        } catch (e: Exception) {
+            sendEvent(UiEvent.ShowToast("Network Error"))
+            false
         }
     }
 
@@ -304,35 +423,27 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         SessionManager.clearSession(getApplication())
     }
 
-    suspend fun updateProfile(name: String, vehicleModel: String, vehicleNumber: String, imageUri: Uri?): Boolean {
-        val result = repository.updateRiderProfile(riderId, name, vehicleModel, vehicleNumber, imageUri)
-        return result.fold(
-            onSuccess = {
-                loadProfile()
-                _uiEvent.emit(UiEvent.ShowToast("Profile Updated Successfully!"))
-                true
-            },
-            onFailure = {
-                _uiEvent.emit(UiEvent.ShowToast("Failed to update profile."))
-                false
-            }
-        )
+    private fun sendEvent(event: UiEvent) {
+        viewModelScope.launch {
+            _uiEvent.send(event)
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        webSocket?.close(1000, "ViewModel cleared")
     }
 }
 
 class RiderViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(RiderViewModel::class.java)) {
+            val repository = RiderRepository(RetrofitClient.instance)
             @Suppress("UNCHECKED_CAST")
-            return RiderViewModel(application) as T
+            return RiderViewModel(application, repository) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class")
     }
-}
-
-sealed class UiEvent {
-    data class ShowToast(val message: String) : UiEvent()
-    data object NavigateToOrders : UiEvent()
 }
 
 
@@ -484,7 +595,6 @@ fun AppBottomNavigation(navController: NavController) {
 // 5. UI SCREENS & COMPONENTS
 // ================================================================================
 
-// --- Login Screen ---
 @Composable
 fun LoginScreen(navController: NavController) {
     Column(
@@ -524,12 +634,9 @@ fun LoginScreen(navController: NavController) {
     }
 }
 
-
-// --- Home Screen (Upcoming Orders) ---
 @Composable
 fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
-    val profile by viewModel.profileState.collectAsState()
-    val pendingOrders by viewModel.pendingOrders.collectAsState()
+    val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
 
     LaunchedEffect(Unit) {
@@ -542,7 +649,7 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
 
     Scaffold(
         topBar = {
-            profile?.let {
+            uiState.profile?.let {
                 HomeTopBar(
                     profile = it,
                     onStatusChangeClick = { viewModel.toggleAvailability() },
@@ -552,13 +659,13 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
         }
     ) { padding ->
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-            if (profile?.isAvailable == false) {
+            if (uiState.profile?.isAvailable == false) {
                 EmptyState(message = "You are currently offline. Go online to receive new order requests.")
-            } else if (pendingOrders.isEmpty()) {
+            } else if (uiState.pendingOrders.isEmpty()) {
                 EmptyState(message = "No new orders right now. We'll notify you!")
             } else {
                 LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    items(pendingOrders) { order ->
+                    items(uiState.pendingOrders) { order ->
                         OrderRequestCard(
                             order = order,
                             onAccept = { viewModel.acceptOrder(order.id) },
@@ -571,14 +678,10 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
     }
 }
 
-// --- Orders Screen (Processed Orders & Balance) ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OrdersScreen(viewModel: RiderViewModel) {
-    val processedOrders by viewModel.processedOrders.collectAsState()
-    val balanceSheet by viewModel.balanceSheet.collectAsState()
-    val selectedFilter by viewModel.processedOrderFilter.collectAsState()
-
+    val uiState by viewModel.uiState.collectAsState()
     var showFilterMenu by remember { mutableStateOf(false) }
     var orderForConfirmation by remember { mutableStateOf<Pair<String, String>?>(null) }
     var orderForCollection by remember { mutableStateOf<Order?>(null) }
@@ -591,7 +694,7 @@ fun OrdersScreen(viewModel: RiderViewModel) {
                 if (action == "Abort") {
                     viewModel.abortOrder(orderId)
                 } else {
-                    orderForCollection = processedOrders.find { it.id == orderId }
+                    orderForCollection = uiState.processedOrders.find { it.id == orderId }
                 }
                 orderForConfirmation = null
             },
@@ -628,7 +731,6 @@ fun OrdersScreen(viewModel: RiderViewModel) {
                         }
                     }
                 },
-                // ADD THIS LINE TO FIX THE ALIGNMENT
                 windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
             )
         }
@@ -638,20 +740,20 @@ fun OrdersScreen(viewModel: RiderViewModel) {
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            item { BalanceSheetCard(balance = balanceSheet) }
+            item { BalanceSheetCard(balance = uiState.balanceSheet) }
             item {
-                val filterText = when (selectedFilter) {
+                val filterText = when (uiState.processedOrderFilter) {
                     ProcessedOrderFilter.ALL -> "All"
                     ProcessedOrderFilter.REJECTED -> "Aborted"
-                    else -> selectedFilter.name.lowercase().replaceFirstChar { it.titlecase() }
+                    else -> uiState.processedOrderFilter.name.lowercase().replaceFirstChar { it.titlecase() }
                 }
                 Text("Orders ($filterText)", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp))
             }
 
-            if (processedOrders.isEmpty()) {
+            if (uiState.processedOrders.isEmpty()) {
                 item { EmptyState(message = "No orders found for this filter.") }
             } else {
-                items(processedOrders) { order ->
+                items(uiState.processedOrders) { order ->
                     ProcessedOrderCard(
                         order = order,
                         onEndOrder = { orderForConfirmation = "End" to order.id },
@@ -663,7 +765,6 @@ fun OrdersScreen(viewModel: RiderViewModel) {
     }
 }
 
-// --- Dialogs ---
 @Composable
 fun ConfirmationDialog(action: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
@@ -866,7 +967,7 @@ fun HomeTopBar(profile: RiderProfile, onStatusChangeClick: () -> Unit, onProfile
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp), // Only horizontal padding
+            .padding(horizontal = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
@@ -951,22 +1052,20 @@ fun EmptyState(message: String) {
     }
 }
 
-// --- Profile Screens ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(navController: NavController, viewModel: RiderViewModel) {
-    val profile by viewModel.profileState.collectAsState()
+    val uiState by viewModel.uiState.collectAsState()
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("My Profile") },
-                // ADD THIS LINE TO FIX THE ALIGNMENT
                 windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
             )
         }
     ) { padding ->
-        profile?.let {
+        uiState.profile?.let {
             Column(
                 modifier = Modifier
                     .padding(padding)
@@ -992,11 +1091,11 @@ fun ProfileScreen(navController: NavController, viewModel: RiderViewModel) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun EditProfileScreen(navController: NavController, viewModel: RiderViewModel) {
-    val profile by viewModel.profileState.collectAsState()
+    val uiState by viewModel.uiState.collectAsState()
     val scope = rememberCoroutineScope()
-    var name by remember(profile) { mutableStateOf(profile?.name ?: "") }
-    var vehicleModel by remember(profile) { mutableStateOf(profile?.vehicleModel ?: "") }
-    var vehicleNumber by remember(profile) { mutableStateOf(profile?.vehicleNumber ?: "") }
+    var name by remember(uiState.profile) { mutableStateOf(uiState.profile?.name ?: "") }
+    var vehicleModel by remember(uiState.profile) { mutableStateOf(uiState.profile?.vehicleModel ?: "") }
+    var vehicleNumber by remember(uiState.profile) { mutableStateOf(uiState.profile?.vehicleNumber ?: "") }
     var imageUri by remember { mutableStateOf<Uri?>(null) }
 
     val imagePickerLauncher = rememberLauncherForActivityResult(contract = ActivityResultContracts.GetContent()) { uri: Uri? -> imageUri = uri }
@@ -1007,7 +1106,6 @@ fun EditProfileScreen(navController: NavController, viewModel: RiderViewModel) {
                 title = { Text("Edit Profile") },
                 navigationIcon = { IconButton(onClick = { navController.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 actions = { IconButton(onClick = { scope.launch { if (viewModel.updateProfile(name, vehicleModel, vehicleNumber, imageUri)) navController.popBackStack() } }) { Icon(Icons.Default.Save, "Save") } },
-                // ADD THIS LINE TO FIX THE ALIGNMENT
                 windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
             )
         }
@@ -1016,7 +1114,7 @@ fun EditProfileScreen(navController: NavController, viewModel: RiderViewModel) {
             item {
                 Box(modifier = Modifier.size(120.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant).clickable { imagePickerLauncher.launch("image/*") }, contentAlignment = Alignment.Center) {
                     val placeholderPainter = rememberVectorPainter(image = Icons.Default.AccountCircle)
-                    AsyncImage(model = imageUri ?: profile?.imageUrl, contentDescription = "Profile Image", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
+                    AsyncImage(model = imageUri ?: uiState.profile?.imageUrl, contentDescription = "Profile Image", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
                     Icon(Icons.Default.Edit, "Edit", tint = Color.White.copy(alpha = 0.7f))
                 }
             }
