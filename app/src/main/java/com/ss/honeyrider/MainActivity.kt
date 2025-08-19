@@ -63,11 +63,13 @@ import kotlinx.coroutines.launch
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
+import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.GET
 import retrofit2.http.Multipart
+import retrofit2.http.POST
 import retrofit2.http.PUT
 import retrofit2.http.Part
 import retrofit2.http.Path
@@ -77,6 +79,11 @@ import kotlin.math.abs
 // ================================================================================
 // 1. DATA LAYER (MODELS, API, REPOSITORY, SESSION MANAGER)
 // ================================================================================
+
+// --- NEW Data classes for Login ---
+data class LoginRequest(val username: String, val password: String)
+data class LoginResponse(val token: String, val id: Long)
+
 
 data class RiderProfile(
     val id: Long,
@@ -90,7 +97,7 @@ data class RiderProfile(
 
 data class Order(
     val id: String,
-    val restaurantName: String,
+    val vendorName: String, // Changed from restaurantName to match backend
     val pickupAddress: String,
     val deliveryAddress: String,
     var status: OrderStatus,
@@ -118,10 +125,19 @@ enum class OrderStatus {
 object SessionManager {
     private const val PREFS_NAME = "RiderPrefs"
     private const val KEY_RIDER_ID = "rider_id"
+    private const val KEY_AUTH_TOKEN = "auth_token"
     private const val DEFAULT_RIDER_ID = -1L
 
     private fun getPrefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    fun saveAuthToken(context: Context, token: String) {
+        getPrefs(context).edit().putString(KEY_AUTH_TOKEN, token).apply()
+    }
+
+    fun getAuthToken(context: Context): String? {
+        return getPrefs(context).getString(KEY_AUTH_TOKEN, null)
     }
 
     fun saveRiderId(context: Context, riderId: Long) {
@@ -138,11 +154,15 @@ object SessionManager {
 }
 
 interface ApiService {
+    // --- NEW Login Endpoint ---
+    @POST("api/auth/rider/login")
+    suspend fun login(@Body request: LoginRequest): Response<LoginResponse>
+
     @GET("api/riders/{id}/profile")
     suspend fun getRiderProfile(@Path("id") riderId: Long): RiderProfile
 
     @PUT("api/riders/{id}/availability")
-    suspend fun updateRiderStatus(@Path("id") riderId: Long, @Body isAvailable: Map<String, Boolean>): retrofit2.Response<Unit>
+    suspend fun updateRiderStatus(@Path("id") riderId: Long, @Body isAvailable: Map<String, Boolean>): Response<Unit>
 
     @Multipart
     @PUT("api/riders/{id}/profile")
@@ -152,27 +172,58 @@ interface ApiService {
         @Part("vehicleModel") vehicleModel: RequestBody,
         @Part("vehicleNumber") vehicleNumber: RequestBody,
         @Part image: MultipartBody.Part?
-    ): retrofit2.Response<Unit>
+    ): Response<Unit>
 
     @PUT("api/orders/{id}/accept-by-rider")
-    suspend fun acceptOrderByRider(@Path("id") orderId: Long): retrofit2.Response<Unit>
+    suspend fun acceptOrderByRider(@Path("id") orderId: Long): Response<Unit>
 
     @PUT("api/orders/{id}/complete-by-rider")
-    suspend fun completeOrderByRider(@Path("id") orderId: Long, @Body tip: Map<String, Double>): retrofit2.Response<Unit>
+    suspend fun completeOrderByRider(@Path("id") orderId: Long, @Body tip: Map<String, Double>): Response<Unit>
 
     @PUT("api/orders/{id}/abort-by-rider")
-    suspend fun abortOrderByRider(@Path("id") orderId: Long): retrofit2.Response<Unit>
+    suspend fun abortOrderByRider(@Path("id") orderId: Long): Response<Unit>
 }
 
 object RetrofitClient {
-    private const val BASE_URL = "http://YOUR_BACKEND_IP:8080/"
+    // IMPORTANT: Replace with your actual backend IP address
+    private const val BASE_URL = "http://192.168.31.242:8080/"
 
-    val instance: ApiService by lazy {
-        val retrofit = Retrofit.Builder()
+    fun getInstance(context: Context): ApiService {
+        val authInterceptor = Interceptor { chain ->
+            val token = SessionManager.getAuthToken(context)
+            val requestBuilder = chain.request().newBuilder()
+            if (token != null) {
+                requestBuilder.addHeader("Authorization", "Bearer $token")
+            }
+            chain.proceed(requestBuilder.build())
+        }
+
+        val client = OkHttpClient.Builder()
+            .addInterceptor(authInterceptor)
+            .build()
+
+        return Retrofit.Builder()
             .baseUrl(BASE_URL)
+            .client(client)
             .addConverterFactory(GsonConverterFactory.create())
             .build()
-        retrofit.create(ApiService::class.java)
+            .create(ApiService::class.java)
+    }
+}
+
+// --- NEW Repository for Authentication ---
+class AuthRepository(private val apiService: ApiService) {
+    suspend fun login(loginRequest: LoginRequest): Result<LoginResponse> {
+        return try {
+            val response = apiService.login(loginRequest)
+            if (response.isSuccessful && response.body() != null) {
+                Result.success(response.body()!!)
+            } else {
+                Result.failure(Exception("Login failed: ${response.message()}"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 }
 
@@ -210,6 +261,7 @@ class RiderRepository(private val apiService: ApiService) {
 // ================================================================================
 
 data class RiderUiState(
+    val isLoading: Boolean = true, // <-- ADDED Loading state
     val profile: RiderProfile? = null,
     val pendingOrders: List<Order> = emptyList(),
     val processedOrders: List<Order> = emptyList(),
@@ -221,14 +273,14 @@ enum class ProcessedOrderFilter { ALL, ACCEPTED, COMPLETED, REJECTED }
 
 sealed class UiEvent {
     data class ShowToast(val message: String) : UiEvent()
+    object NavigateToHome : UiEvent() // For navigation after login
 }
 
 class RiderViewModel(
     application: Application,
-    private val repository: RiderRepository
+    private val repository: RiderRepository,
+    private val authRepository: AuthRepository // <-- ADDED AuthRepository
 ) : AndroidViewModel(application) {
-
-    private val riderId = SessionManager.getRiderId(application)
 
     private val _uiState = MutableStateFlow(RiderUiState())
     val uiState: StateFlow<RiderUiState> = _uiState.asStateFlow()
@@ -242,26 +294,58 @@ class RiderViewModel(
     private val allProcessedOrders = mutableStateListOf<Order>()
 
     init {
+        checkIfLoggedIn()
+    }
+
+    private fun checkIfLoggedIn() {
+        val riderId = SessionManager.getRiderId(getApplication())
         if (riderId != -1L) {
-            fetchProfile()
-            connectToWebSocket()
+            fetchProfileAndConnect(riderId)
+        } else {
+            _uiState.update { it.copy(isLoading = false) }
         }
     }
 
-    private fun fetchProfile() {
+    // --- NEW Login Function ---
+    fun onLoginClicked(username: String, password: String) {
         viewModelScope.launch {
-            try {
-                val profile = repository.getProfile(riderId)
-                _uiState.update { it.copy(profile = profile) }
-            } catch (e: Exception) {
-                sendEvent(UiEvent.ShowToast("Failed to load profile"))
+            _uiState.update { it.copy(isLoading = true) }
+            val result = authRepository.login(LoginRequest(username, password))
+            result.onSuccess { response ->
+                SessionManager.saveAuthToken(getApplication(), response.token)
+                SessionManager.saveRiderId(getApplication(), response.id)
+                fetchProfileAndConnect(response.id)
+                sendEvent(UiEvent.NavigateToHome)
+            }.onFailure {
+                sendEvent(UiEvent.ShowToast(it.message ?: "Login failed"))
+                _uiState.update { it.copy(isLoading = false) }
             }
         }
     }
 
-    private fun connectToWebSocket() {
+
+    private fun fetchProfileAndConnect(riderId: Long) {
+        viewModelScope.launch {
+            try {
+                val profile = repository.getProfile(riderId)
+                _uiState.update { it.copy(profile = profile, isLoading = false) }
+                connectToWebSocket(riderId)
+            } catch (e: Exception) {
+                sendEvent(UiEvent.ShowToast("Failed to load profile"))
+                _uiState.update { it.copy(isLoading = false) }
+            }
+        }
+    }
+
+    private fun connectToWebSocket(riderId: Long) {
         val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
-        val request = Request.Builder().url("ws://YOUR_BACKEND_IP:8080/ws/orders").build()
+
+        // 👇 THIS URL IS UPDATED
+        // It now correctly points to the endpoint for riders and includes the riderId.
+        val request = Request.Builder()
+            .url("ws://192.168.31.242:8080/ws/orders?riderId=$riderId")
+            .build()
+
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onMessage(webSocket: WebSocket, text: String) {
                 try {
@@ -276,25 +360,25 @@ class RiderViewModel(
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
                 sendEvent(UiEvent.ShowToast("Connection error. Retrying..."))
-                // Simple retry logic
                 viewModelScope.launch {
                     delay(5000)
-                    connectToWebSocket()
+                    connectToWebSocket(riderId)
                 }
             }
         })
-        client.dispatcher.executorService.shutdown()
     }
 
     fun toggleAvailability() {
         viewModelScope.launch {
             val currentProfile = _uiState.value.profile ?: return@launch
+            val riderId = SessionManager.getRiderId(getApplication())
             val newAvailability = !currentProfile.isAvailable
             try {
                 val response = repository.updateStatus(riderId, newAvailability)
                 if (response.isSuccessful) {
                     _uiState.update { it.copy(profile = currentProfile.copy(isAvailable = newAvailability)) }
                 } else {
+
                     sendEvent(UiEvent.ShowToast("Failed to update status"))
                 }
             } catch (e: Exception) {
@@ -331,6 +415,7 @@ class RiderViewModel(
     fun completeOrder(orderId: String, tip: Double) {
         viewModelScope.launch {
             try {
+                val riderId = SessionManager.getRiderId(getApplication())
                 val response = repository.completeOrder(orderId.toLong(), tip)
                 if(response.isSuccessful) {
                     updateLocalOrderStatus(orderId, OrderStatus.COMPLETED, tip)
@@ -347,14 +432,14 @@ class RiderViewModel(
     fun abortOrder(orderId: String) {
         viewModelScope.launch {
             try {
+                val riderId = SessionManager.getRiderId(getApplication())
                 val response = repository.abortOrder(orderId.toLong())
                 if(response.isSuccessful) {
-                    // Abort from pending list
                     if (_uiState.value.pendingOrders.any { it.id == orderId }) {
                         _uiState.update {
                             it.copy(pendingOrders = it.pendingOrders.filter { o -> o.id != orderId })
                         }
-                    } else { // Abort from processed (accepted) list
+                    } else {
                         updateLocalOrderStatus(orderId, OrderStatus.REJECTED)
                     }
                     sendEvent(UiEvent.ShowToast("Order Aborted"))
@@ -405,9 +490,10 @@ class RiderViewModel(
 
     suspend fun updateProfile(name: String, vehicleModel: String, vehicleNumber: String, imageUri: Uri?): Boolean {
         return try {
+            val riderId = SessionManager.getRiderId(getApplication())
             val success = repository.updateProfile(riderId, name, vehicleModel, vehicleNumber, imageUri, getApplication())
             if(success) {
-                fetchProfile()
+                fetchProfileAndConnect(riderId)
                 sendEvent(UiEvent.ShowToast("Profile Updated!"))
             } else {
                 sendEvent(UiEvent.ShowToast("Profile update failed"))
@@ -421,6 +507,8 @@ class RiderViewModel(
 
     fun logout() {
         SessionManager.clearSession(getApplication())
+        webSocket?.close(1000, "Logout")
+        _uiState.value = RiderUiState(isLoading = false) // Reset state
     }
 
     private fun sendEvent(event: UiEvent) {
@@ -438,9 +526,11 @@ class RiderViewModel(
 class RiderViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(RiderViewModel::class.java)) {
-            val repository = RiderRepository(RetrofitClient.instance)
+            val apiService = RetrofitClient.getInstance(application)
+            val repository = RiderRepository(apiService)
+            val authRepository = AuthRepository(apiService)
             @Suppress("UNCHECKED_CAST")
-            return RiderViewModel(application, repository) as T
+            return RiderViewModel(application, repository, authRepository) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class")
     }
@@ -475,11 +565,7 @@ private val AppColorScheme = lightColorScheme(
 fun HoneyRiderTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = AppColorScheme,
-        typography = Typography(
-            headlineLarge = MaterialTheme.typography.headlineLarge.copy(fontWeight = FontWeight.Bold),
-            titleLarge = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-            bodyLarge = MaterialTheme.typography.bodyLarge.copy(lineHeight = 24.sp)
-        ),
+        typography = Typography(),
         shapes = Shapes(
             small = RoundedCornerShape(8.dp),
             medium = RoundedCornerShape(16.dp),
@@ -501,9 +587,34 @@ object AppRoutes {
     const val EDIT_PROFILE = "edit_profile"
 }
 
+// --- UPDATED MainScreen to handle initial loading state ---
 @Composable
 fun MainScreen(riderViewModel: RiderViewModel) {
+    val uiState by riderViewModel.uiState.collectAsState()
     val navController = rememberNavController()
+
+    // This effect will navigate the user based on their login status
+    LaunchedEffect(key1 = uiState.profile, key2 = uiState.isLoading) {
+        if (!uiState.isLoading) {
+            val route = if (uiState.profile != null) AppRoutes.HOME else AppRoutes.LOGIN
+            navController.navigate(route) {
+                popUpTo(0) { inclusive = true }
+            }
+        }
+    }
+
+    // This will show a loading spinner until the initial check is complete
+    if (uiState.isLoading) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator()
+        }
+    } else {
+        AppScaffold(navController = navController, riderViewModel = riderViewModel)
+    }
+}
+
+@Composable
+fun AppScaffold(navController: NavHostController, riderViewModel: RiderViewModel) {
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
 
@@ -535,13 +646,14 @@ fun MainScreen(riderViewModel: RiderViewModel) {
 
 @Composable
 fun AppNavigation(navController: NavHostController, riderViewModel: RiderViewModel, paddingValues: PaddingValues) {
+    // Start destination is now flexible, but we set it to Login initially
     NavHost(
         navController = navController,
         startDestination = AppRoutes.LOGIN,
         modifier = Modifier.padding(paddingValues)
     ) {
         composable(AppRoutes.LOGIN) {
-            LoginScreen(navController = navController)
+            LoginScreen(navController = navController, viewModel = riderViewModel)
         }
         composable(AppRoutes.HOME) {
             HomeScreen(navController = navController, viewModel = riderViewModel)
@@ -595,45 +707,68 @@ fun AppBottomNavigation(navController: NavController) {
 // 5. UI SCREENS & COMPONENTS
 // ================================================================================
 
+// --- UPDATED LoginScreen ---
 @Composable
-fun LoginScreen(navController: NavController) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp)
-            .statusBarsPadding()
-            .navigationBarsPadding(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        var username by remember { mutableStateOf("") }
-        var password by remember { mutableStateOf("") }
-        val context = LocalContext.current
+fun LoginScreen(navController: NavController, viewModel: RiderViewModel) {
+    val uiState by viewModel.uiState.collectAsState()
+    val context = LocalContext.current
 
-        Icon(Icons.Default.TwoWheeler, "Rider Icon", modifier = Modifier.size(80.dp), tint = PrimaryRed)
-        Spacer(Modifier.height(16.dp))
-        Text("Rider Login", style = MaterialTheme.typography.headlineMedium)
-        Spacer(Modifier.height(32.dp))
-        OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("Username") }, modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(16.dp))
-        OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("Password") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(24.dp))
-        Button(
-            onClick = {
-                if (username.isNotBlank() && password.isNotBlank()) {
-                    SessionManager.saveRiderId(context, 1L)
+    LaunchedEffect(Unit) {
+        viewModel.uiEvent.collect { event ->
+            when (event) {
+                is UiEvent.ShowToast -> Toast.makeText(context, event.message, Toast.LENGTH_SHORT).show()
+                is UiEvent.NavigateToHome -> {
                     navController.navigate(AppRoutes.HOME) {
                         popUpTo(AppRoutes.LOGIN) { inclusive = true }
                     }
-                } else {
-                    Toast.makeText(context, "Please enter username and password", Toast.LENGTH_SHORT).show()
                 }
-            },
-            modifier = Modifier.fillMaxWidth().height(56.dp)
-        ) { Text("Login") }
+            }
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp)
+                .statusBarsPadding()
+                .navigationBarsPadding(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            var username by remember { mutableStateOf("") }
+            var password by remember { mutableStateOf("") }
+
+            Icon(Icons.Default.TwoWheeler, "Rider Icon", modifier = Modifier.size(80.dp), tint = PrimaryRed)
+            Spacer(Modifier.height(16.dp))
+            Text("Rider Login", style = MaterialTheme.typography.headlineMedium)
+            Spacer(Modifier.height(32.dp))
+            OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("Username") }, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(16.dp))
+            OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("Password") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(24.dp))
+            Button(
+                onClick = {
+                    if (username.isNotBlank() && password.isNotBlank()) {
+                        viewModel.onLoginClicked(username, password)
+                    } else {
+                        Toast.makeText(context, "Please enter username and password", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp)
+            ) { Text("Login") }
+        }
+
+        if (uiState.isLoading) {
+            CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+        }
     }
 }
 
+
+// --- UPDATED HomeScreen to handle null profile during loading ---
 @Composable
 fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
     val uiState by viewModel.uiState.collectAsState()
@@ -659,7 +794,12 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
         }
     ) { padding ->
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-            if (uiState.profile?.isAvailable == false) {
+            if (uiState.profile == null) {
+                // Show a loading indicator if profile is null but not in general loading state
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else if (!uiState.profile!!.isAvailable) {
                 EmptyState(message = "You are currently offline. Go online to receive new order requests.")
             } else if (uiState.pendingOrders.isEmpty()) {
                 EmptyState(message = "No new orders right now. We'll notify you!")
@@ -677,6 +817,7 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
         }
     }
 }
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -730,8 +871,7 @@ fun OrdersScreen(viewModel: RiderViewModel) {
                             DropdownMenuItem(text = { Text("Aborted") }, onClick = { viewModel.setProcessedOrderFilter(ProcessedOrderFilter.REJECTED); showFilterMenu = false })
                         }
                     }
-                },
-                windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
+                }
             )
         }
     ) { padding ->
@@ -858,13 +998,15 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
     }
 
     Card(
-        modifier = Modifier.fillMaxWidth().clickable { isExpanded = !isExpanded },
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { isExpanded = !isExpanded },
         colors = cardColors
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(order.restaurantName, fontWeight = FontWeight.Bold)
+                    Text(order.vendorName, fontWeight = FontWeight.Bold)
                     Text("Order #${order.id}", style = MaterialTheme.typography.bodySmall)
                 }
                 if (order.status == OrderStatus.ACCEPTED) {
@@ -967,7 +1109,7 @@ fun HomeTopBar(profile: RiderProfile, onStatusChangeClick: () -> Unit, onProfile
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp),
+            .padding(16.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
@@ -991,7 +1133,10 @@ fun HomeTopBar(profile: RiderProfile, onStatusChangeClick: () -> Unit, onProfile
         ) {
             AvailabilityIndicator(isAvailable = profile.isAvailable, onClick = onStatusChangeClick)
             val placeholderPainter = rememberVectorPainter(image = Icons.Default.AccountCircle)
-            AsyncImage(model = profile.imageUrl, contentDescription = "Rider Profile", modifier = Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onProfileClick), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
+            AsyncImage(model = profile.imageUrl, contentDescription = "Rider Profile", modifier = Modifier
+                .size(48.dp)
+                .clip(CircleShape)
+                .clickable(onClick = onProfileClick), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
         }
     }
 }
@@ -1012,7 +1157,7 @@ fun OrderRequestCard(order: Order, onAccept: () -> Unit, onDeny: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(4.dp), shape = MaterialTheme.shapes.medium) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text("New Order Request!", style = MaterialTheme.typography.labelMedium, color = PrimaryRed)
-            Text(order.restaurantName, style = MaterialTheme.typography.titleLarge)
+            Text(order.vendorName, style = MaterialTheme.typography.titleLarge)
             Text(order.pickupAddress, style = MaterialTheme.typography.bodyMedium)
             Divider(modifier = Modifier.padding(vertical = 12.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -1047,7 +1192,9 @@ fun InfoColumn(label: String, value: String, alignEnd: Boolean = false) {
 
 @Composable
 fun EmptyState(message: String) {
-    Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+    Box(modifier = Modifier
+        .fillMaxSize()
+        .padding(24.dp), contentAlignment = Alignment.Center) {
         Text(text = message, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
     }
 }
@@ -1061,11 +1208,11 @@ fun ProfileScreen(navController: NavController, viewModel: RiderViewModel) {
         topBar = {
             TopAppBar(
                 title = { Text("My Profile") },
-                windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
             )
         }
     ) { padding ->
-        uiState.profile?.let {
+        // --- ADDED a check for profile being null ---
+        uiState.profile?.let { profile ->
             Column(
                 modifier = Modifier
                     .padding(padding)
@@ -1075,15 +1222,22 @@ fun ProfileScreen(navController: NavController, viewModel: RiderViewModel) {
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 val placeholderPainter = rememberVectorPainter(image = Icons.Default.AccountCircle)
-                AsyncImage(model = it.imageUrl, contentDescription = "Profile Picture", modifier = Modifier.size(120.dp).clip(CircleShape), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
-                Text(it.name, style = MaterialTheme.typography.headlineSmall)
-                Text("@${it.username}", style = MaterialTheme.typography.titleMedium, color = Color.Gray)
+                AsyncImage(model = profile.imageUrl, contentDescription = "Profile Picture", modifier = Modifier
+                    .size(120.dp)
+                    .clip(CircleShape), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
+                Text(profile.name, style = MaterialTheme.typography.headlineSmall)
+                Text("@${profile.username}", style = MaterialTheme.typography.titleMedium, color = Color.Gray)
                 Divider()
-                ProfileInfoRow(icon = Icons.Default.TwoWheeler, label = "Vehicle Model", value = it.vehicleModel)
-                ProfileInfoRow(icon = Icons.Default.ConfirmationNumber, label = "Vehicle Number", value = it.vehicleNumber)
+                ProfileInfoRow(icon = Icons.Default.TwoWheeler, label = "Vehicle Model", value = profile.vehicleModel)
+                ProfileInfoRow(icon = Icons.Default.ConfirmationNumber, label = "Vehicle Number", value = profile.vehicleNumber)
                 Spacer(Modifier.weight(1f))
-                Button(onClick = { viewModel.logout(); navController.navigate(AppRoutes.LOGIN) { popUpTo(0) { inclusive = true } } }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Logout") }
+                Button(onClick = {
+                    viewModel.logout()
+                    navController.navigate(AppRoutes.LOGIN) { popUpTo(0) { inclusive = true } }
+                }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Logout") }
             }
+        } ?: Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator()
         }
     }
 }
@@ -1106,13 +1260,18 @@ fun EditProfileScreen(navController: NavController, viewModel: RiderViewModel) {
                 title = { Text("Edit Profile") },
                 navigationIcon = { IconButton(onClick = { navController.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 actions = { IconButton(onClick = { scope.launch { if (viewModel.updateProfile(name, vehicleModel, vehicleNumber, imageUri)) navController.popBackStack() } }) { Icon(Icons.Default.Save, "Save") } },
-                windowInsets = WindowInsets(0.dp, 0.dp, 0.dp, 0.dp)
             )
         }
     ) { padding ->
-        LazyColumn(modifier = Modifier.padding(padding).fillMaxSize(), contentPadding = PaddingValues(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        LazyColumn(modifier = Modifier
+            .padding(padding)
+            .fillMaxSize(), contentPadding = PaddingValues(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item {
-                Box(modifier = Modifier.size(120.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant).clickable { imagePickerLauncher.launch("image/*") }, contentAlignment = Alignment.Center) {
+                Box(modifier = Modifier
+                    .size(120.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .clickable { imagePickerLauncher.launch("image/*") }, contentAlignment = Alignment.Center) {
                     val placeholderPainter = rememberVectorPainter(image = Icons.Default.AccountCircle)
                     AsyncImage(model = imageUri ?: uiState.profile?.imageUrl, contentDescription = "Profile Image", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
                     Icon(Icons.Default.Edit, "Edit", tint = Color.White.copy(alpha = 0.7f))
@@ -1127,7 +1286,9 @@ fun EditProfileScreen(navController: NavController, viewModel: RiderViewModel) {
 
 @Composable
 fun ProfileInfoRow(icon: ImageVector, label: String, value: String) {
-    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(modifier = Modifier
+        .fillMaxWidth()
+        .padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         Icon(icon, contentDescription = label, tint = PrimaryRed, modifier = Modifier.size(24.dp))
         Spacer(Modifier.width(16.dp))
         Column {
