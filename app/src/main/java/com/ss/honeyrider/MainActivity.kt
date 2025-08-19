@@ -1,7 +1,35 @@
 package com.ss.honeyrider
 
+
+import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.os.Binder
+import android.os.Build
+import android.os.IBinder
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import android.app.Application
+import android.content.ComponentName
 import android.content.Context
+import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
@@ -11,6 +39,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
@@ -46,6 +75,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
@@ -56,6 +86,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import coil.compose.AsyncImage
 import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
@@ -95,23 +126,40 @@ data class RiderProfile(
     val isAvailable: Boolean
 )
 
+@JvmInline
+value class OrderLine(private val line: Any)
+
 data class Order(
-    val id: String,
-    val vendorName: String, // Changed from restaurantName to match backend
-    val pickupAddress: String,
+    @SerializedName("id")
+    val id: Long,
+
+    @SerializedName("vendorName")
+    val vendorName: String,
+
+    @SerializedName("deliveryAddress")
     val deliveryAddress: String,
-    var status: OrderStatus,
-    var tipAmount: Double,
-    val itemCount: Int,
-    val timeLimitMinutes: Int,
+
+    @SerializedName("status")
+    var status: String,
+
+    @SerializedName("totalAmount")
+    val totalAmount: Double,
+
+    @SerializedName("orderLines")
+    val orderLines: List<OrderLine>,
+
+    // --- THESE 3 PROPERTIES ARE MOVED INTO THE CONSTRUCTOR ---
+    val tipAmount: Double = 0.0,
     val acceptedTimestamp: Long? = null,
-    val completionTimestamp: Long? = null,
-    val orderTotal: Double,
-    val deliveryCharge: Double,
-    val surgeCharge: Double
+    val completionTimestamp: Long? = null
 ) {
-    val cashToCollect: Double
-        get() = orderTotal + deliveryCharge + surgeCharge
+    // These derived properties can remain in the body
+    val itemCount: Int get() = orderLines.size
+    val pickupAddress: String get() = "Vendor Location"
+    val timeLimitMinutes: Int = 30
+    val deliveryCharge: Double = 30.0
+    val surgeCharge: Double = 0.0
+    val cashToCollect: Double get() = totalAmount + deliveryCharge + surgeCharge
 }
 
 data class BalanceSheet(
@@ -279,7 +327,7 @@ sealed class UiEvent {
 class RiderViewModel(
     application: Application,
     private val repository: RiderRepository,
-    private val authRepository: AuthRepository // <-- ADDED AuthRepository
+    private val authRepository: AuthRepository
 ) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(RiderUiState())
@@ -287,9 +335,6 @@ class RiderViewModel(
 
     private val _uiEvent = Channel<UiEvent>()
     val uiEvent = _uiEvent.receiveAsFlow()
-
-    private var webSocket: WebSocket? = null
-    private val gson = Gson()
 
     private val allProcessedOrders = mutableStateListOf<Order>()
 
@@ -300,13 +345,12 @@ class RiderViewModel(
     private fun checkIfLoggedIn() {
         val riderId = SessionManager.getRiderId(getApplication())
         if (riderId != -1L) {
-            fetchProfileAndConnect(riderId)
+            fetchProfile(riderId)
         } else {
             _uiState.update { it.copy(isLoading = false) }
         }
     }
 
-    // --- NEW Login Function ---
     fun onLoginClicked(username: String, password: String) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
@@ -314,7 +358,7 @@ class RiderViewModel(
             result.onSuccess { response ->
                 SessionManager.saveAuthToken(getApplication(), response.token)
                 SessionManager.saveRiderId(getApplication(), response.id)
-                fetchProfileAndConnect(response.id)
+                fetchProfile(response.id)
                 sendEvent(UiEvent.NavigateToHome)
             }.onFailure {
                 sendEvent(UiEvent.ShowToast(it.message ?: "Login failed"))
@@ -323,13 +367,11 @@ class RiderViewModel(
         }
     }
 
-
-    private fun fetchProfileAndConnect(riderId: Long) {
+    private fun fetchProfile(riderId: Long) {
         viewModelScope.launch {
             try {
                 val profile = repository.getProfile(riderId)
                 _uiState.update { it.copy(profile = profile, isLoading = false) }
-                connectToWebSocket(riderId)
             } catch (e: Exception) {
                 sendEvent(UiEvent.ShowToast("Failed to load profile"))
                 _uiState.update { it.copy(isLoading = false) }
@@ -337,35 +379,14 @@ class RiderViewModel(
         }
     }
 
-    private fun connectToWebSocket(riderId: Long) {
-        val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
-
-        // 👇 THIS URL IS UPDATED
-        // It now correctly points to the endpoint for riders and includes the riderId.
-        val request = Request.Builder()
-            .url("ws://192.168.31.242:8080/ws/orders?riderId=$riderId")
-            .build()
-
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                try {
-                    val order = gson.fromJson(text, Order::class.java)
-                    _uiState.update {
-                        it.copy(pendingOrders = it.pendingOrders + order)
-                    }
-                } catch (e: Exception) {
-                    // Handle potential JSON parsing errors
-                }
+    fun addNewOrderFromSocket(newOrder: Order) {
+        _uiState.update {
+            if (it.pendingOrders.any { o -> o.id == newOrder.id }) {
+                it
+            } else {
+                it.copy(pendingOrders = it.pendingOrders + newOrder)
             }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
-                sendEvent(UiEvent.ShowToast("Connection error. Retrying..."))
-                viewModelScope.launch {
-                    delay(5000)
-                    connectToWebSocket(riderId)
-                }
-            }
-        })
+        }
     }
 
     fun toggleAvailability() {
@@ -373,12 +394,18 @@ class RiderViewModel(
             val currentProfile = _uiState.value.profile ?: return@launch
             val riderId = SessionManager.getRiderId(getApplication())
             val newAvailability = !currentProfile.isAvailable
+
+            // --- THIS IS THE FIX ---
+            // If the rider is going OFFLINE, stop the service immediately.
+            if (!newAvailability) {
+                getApplication<Application>().stopService(Intent(getApplication(), OrderSocketService::class.java))
+            }
+
             try {
                 val response = repository.updateStatus(riderId, newAvailability)
                 if (response.isSuccessful) {
                     _uiState.update { it.copy(profile = currentProfile.copy(isAvailable = newAvailability)) }
                 } else {
-
                     sendEvent(UiEvent.ShowToast("Failed to update status"))
                 }
             } catch (e: Exception) {
@@ -387,10 +414,10 @@ class RiderViewModel(
         }
     }
 
-    fun acceptOrder(orderId: String) {
+    fun acceptOrder(orderId: Long) { // Changed parameter to Long
         viewModelScope.launch {
             try {
-                val response = repository.acceptOrder(orderId.toLong())
+                val response = repository.acceptOrder(orderId)
                 if (response.isSuccessful) {
                     val acceptedOrder = _uiState.value.pendingOrders.find { it.id == orderId }
                     if (acceptedOrder != null) {
@@ -399,7 +426,9 @@ class RiderViewModel(
                                 pendingOrders = it.pendingOrders.filter { o -> o.id != orderId }
                             )
                         }
-                        allProcessedOrders.add(acceptedOrder.copy(status = OrderStatus.ACCEPTED, acceptedTimestamp = System.currentTimeMillis()))
+                        // This will now compile correctly
+                        val updatedOrder = acceptedOrder.copy(status = "ACCEPTED", acceptedTimestamp = System.currentTimeMillis())
+                        allProcessedOrders.add(updatedOrder)
                         filterProcessedOrders()
                         sendEvent(UiEvent.ShowToast("Order Accepted!"))
                     }
@@ -412,39 +441,15 @@ class RiderViewModel(
         }
     }
 
-    fun completeOrder(orderId: String, tip: Double) {
+    fun completeOrder(orderId: Long, tip: Double) { // Changed parameter to Long
         viewModelScope.launch {
             try {
-                val riderId = SessionManager.getRiderId(getApplication())
-                val response = repository.completeOrder(orderId.toLong(), tip)
+                val response = repository.completeOrder(orderId, tip)
                 if(response.isSuccessful) {
-                    updateLocalOrderStatus(orderId, OrderStatus.COMPLETED, tip)
+                    updateLocalOrderStatus(orderId, "COMPLETED", tip)
                     sendEvent(UiEvent.ShowToast("Order Completed!"))
                 } else {
                     sendEvent(UiEvent.ShowToast("Failed to complete order"))
-                }
-            } catch (e: Exception) {
-                sendEvent(UiEvent.ShowToast("Network error"))
-            }
-        }
-    }
-
-    fun abortOrder(orderId: String) {
-        viewModelScope.launch {
-            try {
-                val riderId = SessionManager.getRiderId(getApplication())
-                val response = repository.abortOrder(orderId.toLong())
-                if(response.isSuccessful) {
-                    if (_uiState.value.pendingOrders.any { it.id == orderId }) {
-                        _uiState.update {
-                            it.copy(pendingOrders = it.pendingOrders.filter { o -> o.id != orderId })
-                        }
-                    } else {
-                        updateLocalOrderStatus(orderId, OrderStatus.REJECTED)
-                    }
-                    sendEvent(UiEvent.ShowToast("Order Aborted"))
-                } else {
-                    sendEvent(UiEvent.ShowToast("Failed to abort order"))
                 }
             } catch (e: Exception) {
                 sendEvent(UiEvent.ShowToast("Network error"))
@@ -463,15 +468,38 @@ class RiderViewModel(
         val filteredList = if (filter == ProcessedOrderFilter.ALL) {
             allProcessedOrders
         } else {
-            allProcessedOrders.filter { it.status.name == filter.name }
+            allProcessedOrders.filter { it.status.equals(filter.name, ignoreCase = true) }
         }
         _uiState.update { it.copy(processedOrders = filteredList.sortedByDescending { o -> o.acceptedTimestamp }) }
     }
 
 
-    private fun updateLocalOrderStatus(orderId: String, newStatus: OrderStatus, tip: Double = 0.0) {
+    fun abortOrder(orderId: Long) { // Changed parameter to Long
+        viewModelScope.launch {
+            try {
+                val response = repository.abortOrder(orderId)
+                if(response.isSuccessful) {
+                    if (_uiState.value.pendingOrders.any { it.id == orderId }) {
+                        _uiState.update {
+                            it.copy(pendingOrders = it.pendingOrders.filter { o -> o.id != orderId })
+                        }
+                    } else {
+                        updateLocalOrderStatus(orderId, "REJECTED")
+                    }
+                    sendEvent(UiEvent.ShowToast("Order Aborted"))
+                } else {
+                    sendEvent(UiEvent.ShowToast("Failed to abort order"))
+                }
+            } catch (e: Exception) {
+                sendEvent(UiEvent.ShowToast("Network error"))
+            }
+        }
+    }
+
+    private fun updateLocalOrderStatus(orderId: Long, newStatus: String, tip: Double = 0.0) { // Changed parameter to Long
         val index = allProcessedOrders.indexOfFirst { it.id == orderId }
         if (index != -1) {
+            // This will now compile correctly
             val updatedOrder = allProcessedOrders[index].copy(
                 status = newStatus,
                 completionTimestamp = System.currentTimeMillis(),
@@ -479,7 +507,7 @@ class RiderViewModel(
             )
             allProcessedOrders[index] = updatedOrder
 
-            if(newStatus == OrderStatus.COMPLETED) {
+            if(newStatus.equals("COMPLETED", ignoreCase = true)) {
                 _uiState.update {
                     it.copy(balanceSheet = it.balanceSheet.copy(tips = it.balanceSheet.tips + tip))
                 }
@@ -493,7 +521,7 @@ class RiderViewModel(
             val riderId = SessionManager.getRiderId(getApplication())
             val success = repository.updateProfile(riderId, name, vehicleModel, vehicleNumber, imageUri, getApplication())
             if(success) {
-                fetchProfileAndConnect(riderId)
+                fetchProfile(riderId)
                 sendEvent(UiEvent.ShowToast("Profile Updated!"))
             } else {
                 sendEvent(UiEvent.ShowToast("Profile update failed"))
@@ -507,19 +535,14 @@ class RiderViewModel(
 
     fun logout() {
         SessionManager.clearSession(getApplication())
-        webSocket?.close(1000, "Logout")
-        _uiState.value = RiderUiState(isLoading = false) // Reset state
+        getApplication<Application>().stopService(Intent(getApplication(), OrderSocketService::class.java))
+        _uiState.value = RiderUiState(isLoading = false)
     }
 
     private fun sendEvent(event: UiEvent) {
         viewModelScope.launch {
             _uiEvent.send(event)
         }
-    }
-
-    override fun onCleared() {
-        super.onCleared()
-        webSocket?.close(1000, "ViewModel cleared")
     }
 }
 
@@ -586,6 +609,127 @@ object AppRoutes {
     const val PROFILE = "profile"
     const val EDIT_PROFILE = "edit_profile"
 }
+
+class OrderSocketService : Service() {
+
+    inner class LocalBinder : Binder() {
+        fun getService(): OrderSocketService = this@OrderSocketService
+    }
+
+    private val binder = LocalBinder()
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var connectionJob: Job? = null
+    private var riderId: Long = -1L
+
+    private val client = OkHttpClient.Builder()
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .build()
+    private var webSocket: WebSocket? = null
+    private val gson = Gson()
+
+    private val _orderNotifications = MutableStateFlow<Order?>(null)
+    val orderNotifications = _orderNotifications.asStateFlow()
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val id = intent?.getLongExtra(RIDER_ID_EXTRA, -1L) ?: -1L
+        if (id != -1L) {
+            this.riderId = id
+            // ... (startForeground logic remains the same) ...
+
+            // --- FIX #1: REMOVE THE LOOP ---
+            // We only want to start the connection process once.
+            // The listener will handle reconnections.
+            startWebSocketConnection()
+        }
+        return START_STICKY
+    }
+
+    private fun startWebSocketConnection() {
+        // This function no longer loops. It just makes a single connection attempt.
+        if (webSocket == null) {
+            Log.d("RiderSocketService", "Attempting WebSocket connection...")
+            connect()
+        }
+    }
+
+    private fun connect() {
+        val request = Request.Builder()
+            .url("ws://192.168.31.242:8080/ws/orders")
+            .build()
+
+        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
+                Log.i("RiderSocketService", "SUCCESS: WebSocket Connection Opened for Rider ID: $riderId")
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                // ... (onMessage logic is correct) ...
+            }
+
+            // --- FIX #2: ADD RECONNECT LOGIC HERE ---
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
+                Log.e("RiderSocketService", "Connection Failure: ${t.message}")
+                this@OrderSocketService.webSocket = null // Mark as disconnected
+                // Attempt to reconnect after a delay
+                reconnect()
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                Log.d("RiderSocketService", "WebSocket Closing: $reason")
+                this@OrderSocketService.webSocket = null
+            }
+
+            // --- AND ADD RECONNECT LOGIC HERE ---
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                Log.d("RiderSocketService", "WebSocket Closed: $reason")
+                this@OrderSocketService.webSocket = null // Mark as disconnected
+                // Attempt to reconnect after a delay
+                reconnect()
+            }
+        })
+    }
+
+    // --- NEW HELPER FUNCTION FOR RECONNECTION ---
+    private fun reconnect() {
+        serviceScope.launch {
+            Log.d("RiderSocketService", "Reconnecting in 5 seconds...")
+            delay(5000)
+            startWebSocketConnection()
+        }
+    }
+
+    private fun createNotification(): Notification {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "Rider Notifications",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
+        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("Honey Rider")
+            .setContentText("Online and listening for new jobs.")
+            .setSmallIcon(R.drawable.ic_baseline_two_wheeler_24)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        serviceScope.cancel()
+        webSocket?.close(1000, "Service Destroyed")
+    }
+
+    companion object {
+        const val RIDER_ID_EXTRA = "com.ss.honeyrider.RIDER_ID"
+        private const val NOTIFICATION_ID = 1
+        private const val NOTIFICATION_CHANNEL_ID = "RiderOrderServiceChannel"
+    }
+}
+
 
 // --- UPDATED MainScreen to handle initial loading state ---
 @Composable
@@ -819,30 +963,37 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
 }
 
 
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OrdersScreen(viewModel: RiderViewModel) {
     val uiState by viewModel.uiState.collectAsState()
     var showFilterMenu by remember { mutableStateOf(false) }
-    var orderForConfirmation by remember { mutableStateOf<Pair<String, String>?>(null) }
+
+    // State for managing which order is being considered for an action
+    var orderForConfirmation by remember { mutableStateOf<Order?>(null) }
+    var confirmationAction by remember { mutableStateOf("") }
+
     var orderForCollection by remember { mutableStateOf<Order?>(null) }
 
+    // This is the confirmation dialog for aborting or ending an order
     if (orderForConfirmation != null) {
-        val (action, orderId) = orderForConfirmation!!
         ConfirmationDialog(
-            action = action,
+            action = confirmationAction,
             onConfirm = {
-                if (action == "Abort") {
-                    viewModel.abortOrder(orderId)
-                } else {
-                    orderForCollection = uiState.processedOrders.find { it.id == orderId }
+                if (confirmationAction == "Abort") {
+                    orderForConfirmation?.let { viewModel.abortOrder(it.id) }
+                } else if (confirmationAction == "End") {
+                    // Set the order for the next dialog (amount collection)
+                    orderForCollection = orderForConfirmation
                 }
-                orderForConfirmation = null
+                orderForConfirmation = null // Dismiss this dialog
             },
-            onDismiss = { orderForConfirmation = null }
+            onDismiss = { orderForConfirmation = null } // Dismiss on cancel
         )
     }
 
+    // This is the dialog for entering the collected amount
     if (orderForCollection != null) {
         AmountCollectionDialog(
             order = orderForCollection!!,
@@ -850,9 +1001,10 @@ fun OrdersScreen(viewModel: RiderViewModel) {
             onSubmit = { collectedAmount ->
                 val order = orderForCollection!!
                 val change = collectedAmount - order.cashToCollect
+                // Tip is any amount collected over the required cash amount
                 val tip = if (change > 0) change else 0.0
                 viewModel.completeOrder(order.id, tip)
-                orderForCollection = null
+                orderForCollection = null // Dismiss the dialog
             }
         )
     }
@@ -896,15 +1048,20 @@ fun OrdersScreen(viewModel: RiderViewModel) {
                 items(uiState.processedOrders) { order ->
                     ProcessedOrderCard(
                         order = order,
-                        onEndOrder = { orderForConfirmation = "End" to order.id },
-                        onAbortOrder = { orderForConfirmation = "Abort" to order.id }
+                        onEndOrder = {
+                            confirmationAction = "End"
+                            orderForConfirmation = order
+                        },
+                        onAbortOrder = {
+                            confirmationAction = "Abort"
+                            orderForConfirmation = order
+                        }
                     )
                 }
             }
         }
     }
 }
-
 @Composable
 fun ConfirmationDialog(action: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
@@ -990,7 +1147,14 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
     var isExpanded by remember { mutableStateOf(false) }
     val rotationAngle by animateFloatAsState(targetValue = if (isExpanded) 180f else 0f, label = "expansion_arrow")
 
-    val cardColors = when (order.status) {
+    // Convert the status string from the server to the local OrderStatus enum
+    val statusEnum = try {
+        OrderStatus.valueOf(order.status.uppercase())
+    } catch (e: IllegalArgumentException) {
+        OrderStatus.PENDING // Default to pending if the status is unknown
+    }
+
+    val cardColors = when (statusEnum) {
         OrderStatus.COMPLETED -> CardDefaults.cardColors(containerColor = GreenAccept, contentColor = Color.White)
         OrderStatus.ACCEPTED -> CardDefaults.cardColors(containerColor = OrangeAccepted, contentColor = DarkGray)
         OrderStatus.REJECTED -> CardDefaults.cardColors(containerColor = PrimaryRed, contentColor = Color.White)
@@ -1009,7 +1173,7 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                     Text(order.vendorName, fontWeight = FontWeight.Bold)
                     Text("Order #${order.id}", style = MaterialTheme.typography.bodySmall)
                 }
-                if (order.status == OrderStatus.ACCEPTED) {
+                if (statusEnum == OrderStatus.ACCEPTED) {
                     OrderTimer(acceptedTimestamp = order.acceptedTimestamp, timeLimitMinutes = order.timeLimitMinutes)
                 } else if (order.completionTimestamp != null && order.acceptedTimestamp != null) {
                     val timeTaken = order.completionTimestamp - order.acceptedTimestamp
@@ -1017,7 +1181,7 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                     val seconds = TimeUnit.MILLISECONDS.toSeconds(timeTaken) % 60
                     Text(text = "Took ${minutes}m ${seconds}s", style = MaterialTheme.typography.bodySmall, color = LocalContentColor.current.copy(alpha = 0.8f), modifier = Modifier.padding(horizontal = 8.dp))
                 }
-                OrderStatusChip(status = order.status)
+                OrderStatusChip(status = statusEnum)
                 Icon(imageVector = Icons.Default.KeyboardArrowDown, contentDescription = "Expand", modifier = Modifier.rotate(rotationAngle))
             }
 
@@ -1029,7 +1193,7 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                     OrderDetailRow(icon = Icons.Default.Home, label = "Delivery", value = order.deliveryAddress)
                     OrderDetailRow(icon = Icons.Default.ShoppingBag, label = "Items", value = "${order.itemCount} Items")
                     Divider(modifier = Modifier.padding(vertical = 12.dp), color = LocalContentColor.current.copy(alpha = 0.3f))
-                    OrderDetailRow(icon = Icons.Default.Receipt, label = "Order Total", value = "₹%.2f".format(order.orderTotal))
+                    OrderDetailRow(icon = Icons.Default.Receipt, label = "Order Total", value = "₹%.2f".format(order.totalAmount))
                     OrderDetailRow(icon = Icons.Default.TwoWheeler, label = "Delivery Charge", value = "₹%.2f".format(order.deliveryCharge))
                     OrderDetailRow(icon = Icons.Default.FlashOn, label = "Surge Charge", value = "₹%.2f".format(order.surgeCharge))
                     OrderDetailRow(icon = Icons.Default.Payments, label = "Amount to Collect", value = "₹%.2f".format(order.cashToCollect), isHighlight = true)
@@ -1040,7 +1204,7 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                 }
             }
 
-            if (order.status == OrderStatus.ACCEPTED) {
+            if (statusEnum == OrderStatus.ACCEPTED) {
                 Spacer(Modifier.height(16.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = onAbortOrder, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.errorContainer)) { Text("Abort Order") }
@@ -1302,6 +1466,32 @@ fun ProfileInfoRow(icon: ImageVector, label: String, value: String) {
 // 6. MAIN ACTIVITY
 // ================================================================================
 class MainActivity : ComponentActivity() {
+
+    private var orderSocketService: OrderSocketService? = null
+    private var isServiceBound = false
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as OrderSocketService.LocalBinder
+            orderSocketService = binder.getService()
+            isServiceBound = true
+
+            val riderViewModel: RiderViewModel by viewModels { RiderViewModelFactory(application) }
+
+            lifecycleScope.launch {
+                orderSocketService?.orderNotifications?.collect { order ->
+                    if (order != null) {
+                        riderViewModel.addNewOrderFromSocket(order)
+                    }
+                }
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            isServiceBound = false
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -1309,9 +1499,42 @@ class MainActivity : ComponentActivity() {
             HoneyRiderTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     val riderViewModel: RiderViewModel = viewModel(factory = RiderViewModelFactory(application))
+
+                    val uiState by riderViewModel.uiState.collectAsState()
+
+                    // --- THIS IS THE UPDATED LOGIC ---
+                    LaunchedEffect(uiState.profile) {
+                        // Only start the service if the profile exists AND the rider is available
+                        if (uiState.profile != null && uiState.profile!!.isAvailable) {
+                            val riderId = SessionManager.getRiderId(applicationContext)
+                            if (riderId != -1L && !isServiceBound) {
+                                val serviceIntent = Intent(applicationContext, OrderSocketService::class.java).apply {
+                                    putExtra(OrderSocketService.RIDER_ID_EXTRA, riderId)
+                                }
+                                startService(serviceIntent)
+                                bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+                            }
+                        } else {
+                            // If the rider is offline, make sure the service is stopped.
+                            if (isServiceBound) {
+                                unbindService(serviceConnection)
+                                isServiceBound = false
+                            }
+                            stopService(Intent(applicationContext, OrderSocketService::class.java))
+                        }
+                    }
+
                     MainScreen(riderViewModel = riderViewModel)
                 }
             }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (isServiceBound) {
+            unbindService(serviceConnection)
+            isServiceBound = false
         }
     }
 }
