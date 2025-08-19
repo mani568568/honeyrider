@@ -535,7 +535,7 @@ class RiderViewModel(
 
     fun logout() {
         SessionManager.clearSession(getApplication())
-        getApplication<Application>().stopService(Intent(getApplication(), OrderSocketService::class.java))
+        // The line stopping the service has been removed.
         _uiState.value = RiderUiState(isLoading = false)
     }
 
@@ -636,15 +636,26 @@ class OrderSocketService : Service() {
         val id = intent?.getLongExtra(RIDER_ID_EXTRA, -1L) ?: -1L
         if (id != -1L) {
             this.riderId = id
-            // ... (startForeground logic remains the same) ...
 
-            // --- FIX #1: REMOVE THE LOOP ---
-            // We only want to start the connection process once.
-            // The listener will handle reconnections.
+            // --- THIS IS THE FIX ---
+            // For newer Android versions, you must specify the service type.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    createNotification(),
+                    // This line specifies the type of work the service is doing.
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                // This is the fallback for older Android versions.
+                startForeground(NOTIFICATION_ID, createNotification())
+            }
+
             startWebSocketConnection()
         }
         return START_STICKY
     }
+
 
     private fun startWebSocketConnection() {
         // This function no longer loops. It just makes a single connection attempt.
@@ -665,7 +676,19 @@ class OrderSocketService : Service() {
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                // ... (onMessage logic is correct) ...
+                Log.i("RiderSocketService", "NEW ORDER MESSAGE: $text")
+                try {
+                    // 1. Parse the incoming JSON string into an Order object
+                    val order = gson.fromJson(text, Order::class.java)
+
+                    // 2. Update the StateFlow with the new order
+                    // This makes the order available to the ViewModel and the UI
+                    _orderNotifications.value = order
+
+                } catch (e: Exception) {
+                    // 3. Log any errors during parsing
+                    Log.e("RiderSocketService", "Error parsing order JSON", e)
+                }
             }
 
             // --- FIX #2: ADD RECONNECT LOGIC HERE ---
@@ -964,6 +987,8 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
 
 
 
+// main/java/com/ss/honeyrider/MainActivity.kt
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OrdersScreen(viewModel: RiderViewModel) {
@@ -981,11 +1006,13 @@ fun OrdersScreen(viewModel: RiderViewModel) {
         ConfirmationDialog(
             action = confirmationAction,
             onConfirm = {
-                if (confirmationAction == "Abort") {
-                    orderForConfirmation?.let { viewModel.abortOrder(it.id) }
-                } else if (confirmationAction == "End") {
-                    // Set the order for the next dialog (amount collection)
-                    orderForCollection = orderForConfirmation
+                orderForConfirmation?.let { order ->
+                    if (confirmationAction == "Abort") {
+                        viewModel.abortOrder(order.id)
+                    } else if (confirmationAction == "End") {
+                        // Set the order for the next dialog (amount collection)
+                        orderForCollection = order
+                    }
                 }
                 orderForConfirmation = null // Dismiss this dialog
             },
@@ -1062,6 +1089,7 @@ fun OrdersScreen(viewModel: RiderViewModel) {
         }
     }
 }
+
 @Composable
 fun ConfirmationDialog(action: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
@@ -1121,8 +1149,6 @@ fun AmountCollectionDialog(order: Order, onDismiss: () -> Unit, onSubmit: (Doubl
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
 }
-
-
 @Composable
 fun BalanceSheetCard(balance: BalanceSheet) {
     Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(4.dp)) {
