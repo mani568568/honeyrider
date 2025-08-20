@@ -212,6 +212,10 @@ object SessionManager {
     }
 }
 
+data class RiderJobsResponse(
+    val myAcceptedOrders: List<Order>,
+    val availableJobs: List<Order>
+)
 // --- CHANGE #3: ADDED verifyOtp to ApiService ---
 interface ApiService {
     @POST("api/auth/rider/login")
@@ -244,6 +248,9 @@ interface ApiService {
 
     @PUT("api/orders/{id}/abort-by-rider")
     suspend fun abortOrderByRider(@Path("id") orderId: Long): Response<Unit>
+
+    @GET("api/orders/rider-jobs")
+    suspend fun getRiderJobs(@retrofit2.http.Query("riderId") riderId: Long): Response<RiderJobsResponse>
 }
 
 object RetrofitClient {
@@ -295,6 +302,7 @@ class RiderRepository(private val apiService: ApiService) {
     suspend fun verifyOtp(orderId: Long, otp: String) = apiService.verifyOtp(orderId, mapOf("otp" to otp)) // New function
     suspend fun completeOrder(orderId: Long, tip: Double) = apiService.completeOrderByRider(orderId, mapOf("tip" to tip))
     suspend fun abortOrder(orderId: Long) = apiService.abortOrderByRider(orderId)
+    suspend fun getRiderJobs(riderId: Long): Response<RiderJobsResponse> = apiService.getRiderJobs(riderId)
 
     suspend fun updateProfile(riderId: Long, name: String, vehicleModel: String, vehicleNumber: String, imageUri: Uri?, context: Context): Boolean {
         val nameBody = name.toRequestBody("text/plain".toMediaTypeOrNull())
@@ -386,6 +394,10 @@ class RiderViewModel(
             try {
                 val profile = repository.getProfile(riderId)
                 _uiState.update { it.copy(profile = profile, isLoading = false) }
+                // Fetch available jobs when the profile is loaded (after login)
+                if (profile.isAvailable) {
+                    syncRiderState(riderId)
+                }
             } catch (e: Exception) {
                 sendEvent(UiEvent.ShowToast("Failed to load profile"))
                 _uiState.update { it.copy(isLoading = false) }
@@ -455,11 +467,42 @@ class RiderViewModel(
                 val response = repository.updateStatus(riderId, newAvailability)
                 if (response.isSuccessful) {
                     _uiState.update { it.copy(profile = currentProfile.copy(isAvailable = newAvailability)) }
+                    if (newAvailability) {
+                        syncRiderState(riderId)
+                    }
                 } else {
                     sendEvent(UiEvent.ShowToast("Failed to update status"))
                 }
             } catch (e: Exception) {
                 sendEvent(UiEvent.ShowToast("Network error"))
+            }
+        }
+    }
+
+    private fun syncRiderState(riderId: Long) {
+        viewModelScope.launch {
+            try {
+                val response = repository.getRiderJobs(riderId)
+                if (response.isSuccessful) {
+                    response.body()?.let { jobs ->
+                        // Add the rider's accepted jobs to the processed list
+                        jobs.myAcceptedOrders.forEach { acceptedOrder ->
+                            if (allProcessedOrders.none { it.id == acceptedOrder.id }) {
+                                allProcessedOrders.add(acceptedOrder)
+                            }
+                        }
+                        filterProcessedOrders()
+
+                        // Add the new available jobs to the pending list
+                        _uiState.update {
+                            val currentIds = it.pendingOrders.map { o -> o.id }.toSet()
+                            val newOrders = jobs.availableJobs.filter { o -> !currentIds.contains(o.id) }
+                            it.copy(pendingOrders = it.pendingOrders + newOrders)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("RiderViewModel", "Failed to sync rider state", e)
             }
         }
     }
