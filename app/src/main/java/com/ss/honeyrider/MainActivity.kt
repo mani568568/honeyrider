@@ -129,8 +129,9 @@ data class RiderProfile(
 @JvmInline
 value class OrderLine(private val line: Any)
 
+// --- CHANGE #1: MODIFIED Order data class ---
 data class Order(
-    @SerializedName("id")
+    @SerializedName(value = "id", alternate = ["orderId"])
     val id: Long,
 
     @SerializedName("vendorName")
@@ -148,12 +149,15 @@ data class Order(
     @SerializedName("orderLines")
     val orderLines: List<OrderLine>,
 
-    // --- THESE 3 PROPERTIES ARE MOVED INTO THE CONSTRUCTOR ---
+    @SerializedName("otp") // Added OTP field
+    val otp: String? = null,
+
+    // Renamed for clarity and to separate from OTP verification
     val tipAmount: Double = 0.0,
     val acceptedTimestamp: Long? = null,
+    val pickupTimestamp: Long? = null, // This will now start the timer
     val completionTimestamp: Long? = null
 ) {
-    // These derived properties can remain in the body
     val itemCount: Int get() = orderLines.size
     val pickupAddress: String get() = "Vendor Location"
     val timeLimitMinutes: Int = 30
@@ -166,8 +170,15 @@ data class BalanceSheet(
     val tips: Double
 )
 
+// --- CHANGE #2: UPDATED OrderStatus enum ---
 enum class OrderStatus {
-    PENDING, ACCEPTED, REJECTED, COMPLETED
+    PENDING,
+    ACCEPTED,
+    REJECTED,
+    COMPLETED,
+    READY, // Status when vendor has prepared the order
+    ACCEPTED_BY_RIDER, // Status when rider accepts the job
+    OUT_FOR_DELIVERY // Status after OTP verification
 }
 
 object SessionManager {
@@ -201,8 +212,8 @@ object SessionManager {
     }
 }
 
+// --- CHANGE #3: ADDED verifyOtp to ApiService ---
 interface ApiService {
-    // --- NEW Login Endpoint ---
     @POST("api/auth/rider/login")
     suspend fun login(@Body request: LoginRequest): Response<LoginResponse>
 
@@ -225,6 +236,9 @@ interface ApiService {
     @PUT("api/orders/{id}/accept-by-rider")
     suspend fun acceptOrderByRider(@Path("id") orderId: Long): Response<Unit>
 
+    @POST("api/orders/{id}/verify-otp") // New endpoint for OTP verification
+    suspend fun verifyOtp(@Path("id") orderId: Long, @Body payload: Map<String, String>): Response<Unit>
+
     @PUT("api/orders/{id}/complete-by-rider")
     suspend fun completeOrderByRider(@Path("id") orderId: Long, @Body tip: Map<String, Double>): Response<Unit>
 
@@ -233,7 +247,6 @@ interface ApiService {
 }
 
 object RetrofitClient {
-    // IMPORTANT: Replace with your actual backend IP address
     private const val BASE_URL = "http://192.168.31.242:8080/"
 
     fun getInstance(context: Context): ApiService {
@@ -259,7 +272,6 @@ object RetrofitClient {
     }
 }
 
-// --- NEW Repository for Authentication ---
 class AuthRepository(private val apiService: ApiService) {
     suspend fun login(loginRequest: LoginRequest): Result<LoginResponse> {
         return try {
@@ -275,11 +287,12 @@ class AuthRepository(private val apiService: ApiService) {
     }
 }
 
-
+// --- CHANGE #4: ADDED verifyOtp to RiderRepository ---
 class RiderRepository(private val apiService: ApiService) {
     suspend fun getProfile(riderId: Long) = apiService.getRiderProfile(riderId)
     suspend fun updateStatus(riderId: Long, isAvailable: Boolean) = apiService.updateRiderStatus(riderId, mapOf("isAvailable" to isAvailable))
     suspend fun acceptOrder(orderId: Long) = apiService.acceptOrderByRider(orderId)
+    suspend fun verifyOtp(orderId: Long, otp: String) = apiService.verifyOtp(orderId, mapOf("otp" to otp)) // New function
     suspend fun completeOrder(orderId: Long, tip: Double) = apiService.completeOrderByRider(orderId, mapOf("tip" to tip))
     suspend fun abortOrder(orderId: Long) = apiService.abortOrderByRider(orderId)
 
@@ -309,7 +322,7 @@ class RiderRepository(private val apiService: ApiService) {
 // ================================================================================
 
 data class RiderUiState(
-    val isLoading: Boolean = true, // <-- ADDED Loading state
+    val isLoading: Boolean = true,
     val profile: RiderProfile? = null,
     val pendingOrders: List<Order> = emptyList(),
     val processedOrders: List<Order> = emptyList(),
@@ -321,9 +334,10 @@ enum class ProcessedOrderFilter { ALL, ACCEPTED, COMPLETED, REJECTED }
 
 sealed class UiEvent {
     data class ShowToast(val message: String) : UiEvent()
-    object NavigateToHome : UiEvent() // For navigation after login
+    object NavigateToHome : UiEvent()
 }
 
+// --- CHANGE #5: UPDATED RiderViewModel with new OTP logic ---
 class RiderViewModel(
     application: Application,
     private val repository: RiderRepository,
@@ -379,12 +393,39 @@ class RiderViewModel(
         }
     }
 
+
     fun addNewOrderFromSocket(newOrder: Order) {
-        _uiState.update {
-            if (it.pendingOrders.any { o -> o.id == newOrder.id }) {
-                it
-            } else {
-                it.copy(pendingOrders = it.pendingOrders + newOrder)
+        viewModelScope.launch {
+            // Check if this is an update to an order the rider has already accepted.
+            val existingProcessedIndex = allProcessedOrders.indexOfFirst { it.id == newOrder.id }
+
+            if (existingProcessedIndex != -1) {
+                // If the order exists in the processed list, update its status.
+                val updatedOrder = allProcessedOrders[existingProcessedIndex].copy(
+                    status = newOrder.status,
+                    otp = newOrder.otp ?: allProcessedOrders[existingProcessedIndex].otp
+                )
+                allProcessedOrders[existingProcessedIndex] = updatedOrder
+                filterProcessedOrders()
+                return@launch
+            }
+
+            // FIX: Handle the case where the order is no longer pending but not yet processed.
+            // This is a safety net for situations where the app re-connects after an event.
+            val isPending = _uiState.value.pendingOrders.any { it.id == newOrder.id }
+            if (isPending) {
+                // Remove the order from pending list and add it to processed.
+                _uiState.update { it.copy(pendingOrders = it.pendingOrders.filter { o -> o.id != newOrder.id }) }
+                allProcessedOrders.add(newOrder)
+                filterProcessedOrders()
+                sendEvent(UiEvent.ShowToast("Order #${newOrder.id} status updated to ${newOrder.status.replace("_", " ")}"))
+                return@launch
+            }
+
+            // If it's a new job offer, add it to the pending list.
+            if (newOrder.status.equals("ACCEPTED", ignoreCase = true) || newOrder.status.equals("READY", ignoreCase = true)) {
+                _uiState.update { it.copy(pendingOrders = it.pendingOrders + newOrder) }
+                sendEvent(UiEvent.ShowToast("New Order #${newOrder.id} is now available!"))
             }
         }
     }
@@ -395,8 +436,6 @@ class RiderViewModel(
             val riderId = SessionManager.getRiderId(getApplication())
             val newAvailability = !currentProfile.isAvailable
 
-            // --- THIS IS THE FIX ---
-            // If the rider is going OFFLINE, stop the service immediately.
             if (!newAvailability) {
                 getApplication<Application>().stopService(Intent(getApplication(), OrderSocketService::class.java))
             }
@@ -414,7 +453,7 @@ class RiderViewModel(
         }
     }
 
-    fun acceptOrder(orderId: Long) { // Changed parameter to Long
+    fun acceptOrder(orderId: Long) {
         viewModelScope.launch {
             try {
                 val response = repository.acceptOrder(orderId)
@@ -426,11 +465,11 @@ class RiderViewModel(
                                 pendingOrders = it.pendingOrders.filter { o -> o.id != orderId }
                             )
                         }
-                        // This will now compile correctly
-                        val updatedOrder = acceptedOrder.copy(status = "ACCEPTED", acceptedTimestamp = System.currentTimeMillis())
+                        // Update status, but DO NOT start the timer here
+                        val updatedOrder = acceptedOrder.copy(status = "ACCEPTED_BY_RIDER", acceptedTimestamp = System.currentTimeMillis())
                         allProcessedOrders.add(updatedOrder)
                         filterProcessedOrders()
-                        sendEvent(UiEvent.ShowToast("Order Accepted!"))
+                        sendEvent(UiEvent.ShowToast("Order Accepted! Proceed to vendor for pickup."))
                     }
                 } else {
                     sendEvent(UiEvent.ShowToast("Failed to accept order"))
@@ -441,12 +480,30 @@ class RiderViewModel(
         }
     }
 
-    fun completeOrder(orderId: Long, tip: Double) { // Changed parameter to Long
+    // New function to handle OTP verification
+    fun verifyOtp(orderId: Long, otp: String) {
+        viewModelScope.launch {
+            try {
+                val response = repository.verifyOtp(orderId, otp)
+                if (response.isSuccessful) {
+                    // Find the order, update its status, AND set the pickupTimestamp to start the timer
+                    updateLocalOrderStatus(orderId, "OUT_FOR_DELIVERY", newPickupTimestamp = System.currentTimeMillis())
+                    sendEvent(UiEvent.ShowToast("OTP Verified! Delivery started."))
+                } else {
+                    sendEvent(UiEvent.ShowToast("Invalid OTP. Please try again."))
+                }
+            } catch (e: Exception) {
+                sendEvent(UiEvent.ShowToast("Network error during OTP verification."))
+            }
+        }
+    }
+
+    fun completeOrder(orderId: Long, tip: Double) {
         viewModelScope.launch {
             try {
                 val response = repository.completeOrder(orderId, tip)
                 if(response.isSuccessful) {
-                    updateLocalOrderStatus(orderId, "COMPLETED", tip)
+                    updateLocalOrderStatus(orderId, "COMPLETED", newTip = tip)
                     sendEvent(UiEvent.ShowToast("Order Completed!"))
                 } else {
                     sendEvent(UiEvent.ShowToast("Failed to complete order"))
@@ -474,7 +531,7 @@ class RiderViewModel(
     }
 
 
-    fun abortOrder(orderId: Long) { // Changed parameter to Long
+    fun abortOrder(orderId: Long) {
         viewModelScope.launch {
             try {
                 val response = repository.abortOrder(orderId)
@@ -496,20 +553,27 @@ class RiderViewModel(
         }
     }
 
-    private fun updateLocalOrderStatus(orderId: Long, newStatus: String, tip: Double = 0.0) { // Changed parameter to Long
+    // Updated function to handle different types of local updates
+    private fun updateLocalOrderStatus(
+        orderId: Long,
+        newStatus: String,
+        newTip: Double? = null,
+        newPickupTimestamp: Long? = null
+    ) {
         val index = allProcessedOrders.indexOfFirst { it.id == orderId }
         if (index != -1) {
-            // This will now compile correctly
-            val updatedOrder = allProcessedOrders[index].copy(
+            val originalOrder = allProcessedOrders[index]
+            val updatedOrder = originalOrder.copy(
                 status = newStatus,
-                completionTimestamp = System.currentTimeMillis(),
-                tipAmount = tip
+                completionTimestamp = if (newStatus == "COMPLETED") System.currentTimeMillis() else originalOrder.completionTimestamp,
+                tipAmount = newTip ?: originalOrder.tipAmount,
+                pickupTimestamp = newPickupTimestamp ?: originalOrder.pickupTimestamp
             )
             allProcessedOrders[index] = updatedOrder
 
-            if(newStatus.equals("COMPLETED", ignoreCase = true)) {
+            if(newStatus.equals("COMPLETED", ignoreCase = true) && newTip != null) {
                 _uiState.update {
-                    it.copy(balanceSheet = it.balanceSheet.copy(tips = it.balanceSheet.tips + tip))
+                    it.copy(balanceSheet = it.balanceSheet.copy(tips = it.balanceSheet.tips + newTip))
                 }
             }
             filterProcessedOrders()
@@ -535,7 +599,6 @@ class RiderViewModel(
 
     fun logout() {
         SessionManager.clearSession(getApplication())
-        // The line stopping the service has been removed.
         _uiState.value = RiderUiState(isLoading = false)
     }
 
@@ -571,6 +634,7 @@ private val LightGray = Color(0xFFBDBDBD)
 private val GreenAccept = Color(0xFF4CAF50)
 private val PurpleAccept = Color(0xFF673AB7)
 private val OrangeAccepted = Color(0xFFFFA726)
+private val BlueVerified = Color(0xFF2196F3) // New color for verified status
 
 private val AppColorScheme = lightColorScheme(
     primary = PrimaryRed,
@@ -599,7 +663,7 @@ fun HoneyRiderTheme(content: @Composable () -> Unit) {
 }
 
 // ================================================================================
-// 4. NAVIGATION
+// 4. NAVIGATION & SERVICE
 // ================================================================================
 
 object AppRoutes {
@@ -636,21 +700,15 @@ class OrderSocketService : Service() {
         val id = intent?.getLongExtra(RIDER_ID_EXTRA, -1L) ?: -1L
         if (id != -1L) {
             this.riderId = id
-
-            // --- THIS IS THE FIX ---
-            // For newer Android versions, you must specify the service type.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
                     NOTIFICATION_ID,
                     createNotification(),
-                    // This line specifies the type of work the service is doing.
                     android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
                 )
             } else {
-                // This is the fallback for older Android versions.
                 startForeground(NOTIFICATION_ID, createNotification())
             }
-
             startWebSocketConnection()
         }
         return START_STICKY
@@ -658,7 +716,6 @@ class OrderSocketService : Service() {
 
 
     private fun startWebSocketConnection() {
-        // This function no longer loops. It just makes a single connection attempt.
         if (webSocket == null) {
             Log.d("RiderSocketService", "Attempting WebSocket connection...")
             connect()
@@ -666,8 +723,9 @@ class OrderSocketService : Service() {
     }
 
     private fun connect() {
+        // FIX: Added the riderId as a query parameter to the WebSocket URL.
         val request = Request.Builder()
-            .url("ws://192.168.31.242:8080/ws/orders")
+            .url("ws://192.168.31.242:8080/ws/orders?riderId=$riderId")
             .build()
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
@@ -678,24 +736,16 @@ class OrderSocketService : Service() {
             override fun onMessage(webSocket: WebSocket, text: String) {
                 Log.i("RiderSocketService", "NEW ORDER MESSAGE: $text")
                 try {
-                    // 1. Parse the incoming JSON string into an Order object
                     val order = gson.fromJson(text, Order::class.java)
-
-                    // 2. Update the StateFlow with the new order
-                    // This makes the order available to the ViewModel and the UI
                     _orderNotifications.value = order
-
                 } catch (e: Exception) {
-                    // 3. Log any errors during parsing
                     Log.e("RiderSocketService", "Error parsing order JSON", e)
                 }
             }
 
-            // --- FIX #2: ADD RECONNECT LOGIC HERE ---
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
                 Log.e("RiderSocketService", "Connection Failure: ${t.message}")
-                this@OrderSocketService.webSocket = null // Mark as disconnected
-                // Attempt to reconnect after a delay
+                this@OrderSocketService.webSocket = null
                 reconnect()
             }
 
@@ -704,17 +754,14 @@ class OrderSocketService : Service() {
                 this@OrderSocketService.webSocket = null
             }
 
-            // --- AND ADD RECONNECT LOGIC HERE ---
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d("RiderSocketService", "WebSocket Closed: $reason")
-                this@OrderSocketService.webSocket = null // Mark as disconnected
-                // Attempt to reconnect after a delay
+                this@OrderSocketService.webSocket = null
                 reconnect()
             }
         })
     }
 
-    // --- NEW HELPER FUNCTION FOR RECONNECTION ---
     private fun reconnect() {
         serviceScope.launch {
             Log.d("RiderSocketService", "Reconnecting in 5 seconds...")
@@ -754,13 +801,11 @@ class OrderSocketService : Service() {
 }
 
 
-// --- UPDATED MainScreen to handle initial loading state ---
 @Composable
 fun MainScreen(riderViewModel: RiderViewModel) {
     val uiState by riderViewModel.uiState.collectAsState()
     val navController = rememberNavController()
 
-    // This effect will navigate the user based on their login status
     LaunchedEffect(key1 = uiState.profile, key2 = uiState.isLoading) {
         if (!uiState.isLoading) {
             val route = if (uiState.profile != null) AppRoutes.HOME else AppRoutes.LOGIN
@@ -770,7 +815,6 @@ fun MainScreen(riderViewModel: RiderViewModel) {
         }
     }
 
-    // This will show a loading spinner until the initial check is complete
     if (uiState.isLoading) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             CircularProgressIndicator()
@@ -813,7 +857,6 @@ fun AppScaffold(navController: NavHostController, riderViewModel: RiderViewModel
 
 @Composable
 fun AppNavigation(navController: NavHostController, riderViewModel: RiderViewModel, paddingValues: PaddingValues) {
-    // Start destination is now flexible, but we set it to Login initially
     NavHost(
         navController = navController,
         startDestination = AppRoutes.LOGIN,
@@ -874,7 +917,6 @@ fun AppBottomNavigation(navController: NavController) {
 // 5. UI SCREENS & COMPONENTS
 // ================================================================================
 
-// --- UPDATED LoginScreen ---
 @Composable
 fun LoginScreen(navController: NavController, viewModel: RiderViewModel) {
     val uiState by viewModel.uiState.collectAsState()
@@ -934,8 +976,6 @@ fun LoginScreen(navController: NavController, viewModel: RiderViewModel) {
     }
 }
 
-
-// --- UPDATED HomeScreen to handle null profile during loading ---
 @Composable
 fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
     val uiState by viewModel.uiState.collectAsState()
@@ -962,7 +1002,6 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
     ) { padding ->
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
             if (uiState.profile == null) {
-                // Show a loading indicator if profile is null but not in general loading state
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
@@ -986,41 +1025,33 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
 }
 
 
-
-// main/java/com/ss/honeyrider/MainActivity.kt
-
+// --- CHANGE #6: MAJOR REFACTOR of OrdersScreen and its components ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OrdersScreen(viewModel: RiderViewModel) {
     val uiState by viewModel.uiState.collectAsState()
     var showFilterMenu by remember { mutableStateOf(false) }
-
-    // State for managing which order is being considered for an action
     var orderForConfirmation by remember { mutableStateOf<Order?>(null) }
     var confirmationAction by remember { mutableStateOf("") }
-
     var orderForCollection by remember { mutableStateOf<Order?>(null) }
+    var orderForOtp by remember { mutableStateOf<Order?>(null) }
 
-    // This is the confirmation dialog for aborting or ending an order
+    // Confirmation for Abort/End
     if (orderForConfirmation != null) {
         ConfirmationDialog(
             action = confirmationAction,
             onConfirm = {
                 orderForConfirmation?.let { order ->
-                    if (confirmationAction == "Abort") {
-                        viewModel.abortOrder(order.id)
-                    } else if (confirmationAction == "End") {
-                        // Set the order for the next dialog (amount collection)
-                        orderForCollection = order
-                    }
+                    if (confirmationAction == "Abort") viewModel.abortOrder(order.id)
+                    else if (confirmationAction == "End") orderForCollection = order
                 }
-                orderForConfirmation = null // Dismiss this dialog
+                orderForConfirmation = null
             },
-            onDismiss = { orderForConfirmation = null } // Dismiss on cancel
+            onDismiss = { orderForConfirmation = null }
         )
     }
 
-    // This is the dialog for entering the collected amount
+    // Dialog for collecting cash
     if (orderForCollection != null) {
         AmountCollectionDialog(
             order = orderForCollection!!,
@@ -1028,10 +1059,21 @@ fun OrdersScreen(viewModel: RiderViewModel) {
             onSubmit = { collectedAmount ->
                 val order = orderForCollection!!
                 val change = collectedAmount - order.cashToCollect
-                // Tip is any amount collected over the required cash amount
                 val tip = if (change > 0) change else 0.0
                 viewModel.completeOrder(order.id, tip)
-                orderForCollection = null // Dismiss the dialog
+                orderForCollection = null
+            }
+        )
+    }
+
+    // New Dialog for OTP Verification
+    if (orderForOtp != null) {
+        OtpVerificationDialog(
+            order = orderForOtp!!,
+            onDismiss = { orderForOtp = null },
+            onSubmit = { otp ->
+                viewModel.verifyOtp(orderForOtp!!.id, otp)
+                orderForOtp = null
             }
         )
     }
@@ -1075,6 +1117,7 @@ fun OrdersScreen(viewModel: RiderViewModel) {
                 items(uiState.processedOrders) { order ->
                     ProcessedOrderCard(
                         order = order,
+                        onVerifyPickup = { orderForOtp = order },
                         onEndOrder = {
                             confirmationAction = "End"
                             orderForConfirmation = order
@@ -1149,6 +1192,36 @@ fun AmountCollectionDialog(order: Order, onDismiss: () -> Unit, onSubmit: (Doubl
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
 }
+
+// New Dialog for OTP
+@Composable
+fun OtpVerificationDialog(order: Order, onDismiss: () -> Unit, onSubmit: (String) -> Unit) {
+    var otpText by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Verify Pickup") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Enter the 4-digit OTP from the vendor to confirm you have picked up the order.")
+                OutlinedTextField(
+                    value = otpText,
+                    onValueChange = { if (it.length <= 4) otpText = it.filter { char -> char.isDigit() } },
+                    label = { Text("Enter OTP") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onSubmit(otpText) },
+                enabled = otpText.length == 4
+            ) { Text("Verify & Start Delivery") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
 @Composable
 fun BalanceSheetCard(balance: BalanceSheet) {
     Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(4.dp)) {
@@ -1169,20 +1242,28 @@ fun BalanceRow(label: String, amount: Double) {
 }
 
 @Composable
-fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () -> Unit) {
+fun ProcessedOrderCard(
+    order: Order,
+    onVerifyPickup: () -> Unit,
+    onEndOrder: () -> Unit,
+    onAbortOrder: () -> Unit
+) {
     var isExpanded by remember { mutableStateOf(false) }
     val rotationAngle by animateFloatAsState(targetValue = if (isExpanded) 180f else 0f, label = "expansion_arrow")
 
-    // Convert the status string from the server to the local OrderStatus enum
     val statusEnum = try {
         OrderStatus.valueOf(order.status.uppercase())
     } catch (e: IllegalArgumentException) {
-        OrderStatus.PENDING // Default to pending if the status is unknown
+        OrderStatus.PENDING
     }
+
+    // This condition is now updated to show the OTP for both statuses
+    val shouldShowOtp = (statusEnum == OrderStatus.ACCEPTED_BY_RIDER || statusEnum == OrderStatus.READY) && !order.otp.isNullOrBlank()
 
     val cardColors = when (statusEnum) {
         OrderStatus.COMPLETED -> CardDefaults.cardColors(containerColor = GreenAccept, contentColor = Color.White)
-        OrderStatus.ACCEPTED -> CardDefaults.cardColors(containerColor = OrangeAccepted, contentColor = DarkGray)
+        OrderStatus.ACCEPTED_BY_RIDER -> CardDefaults.cardColors(containerColor = OrangeAccepted, contentColor = DarkGray)
+        OrderStatus.OUT_FOR_DELIVERY -> CardDefaults.cardColors(containerColor = BlueVerified, contentColor = Color.White)
         OrderStatus.REJECTED -> CardDefaults.cardColors(containerColor = PrimaryRed, contentColor = Color.White)
         else -> CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     }
@@ -1199,10 +1280,10 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                     Text(order.vendorName, fontWeight = FontWeight.Bold)
                     Text("Order #${order.id}", style = MaterialTheme.typography.bodySmall)
                 }
-                if (statusEnum == OrderStatus.ACCEPTED) {
-                    OrderTimer(acceptedTimestamp = order.acceptedTimestamp, timeLimitMinutes = order.timeLimitMinutes)
-                } else if (order.completionTimestamp != null && order.acceptedTimestamp != null) {
-                    val timeTaken = order.completionTimestamp - order.acceptedTimestamp
+                if (statusEnum == OrderStatus.OUT_FOR_DELIVERY) {
+                    OrderTimer(acceptedTimestamp = order.pickupTimestamp, timeLimitMinutes = order.timeLimitMinutes)
+                } else if (order.completionTimestamp != null && order.pickupTimestamp != null) {
+                    val timeTaken = order.completionTimestamp - order.pickupTimestamp
                     val minutes = TimeUnit.MILLISECONDS.toMinutes(timeTaken)
                     val seconds = TimeUnit.MILLISECONDS.toSeconds(timeTaken) % 60
                     Text(text = "Took ${minutes}m ${seconds}s", style = MaterialTheme.typography.bodySmall, color = LocalContentColor.current.copy(alpha = 0.8f), modifier = Modifier.padding(horizontal = 8.dp))
@@ -1210,6 +1291,33 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                 OrderStatusChip(status = statusEnum)
                 Icon(imageVector = Icons.Default.KeyboardArrowDown, contentDescription = "Expand", modifier = Modifier.rotate(rotationAngle))
             }
+            if (shouldShowOtp) {
+                Spacer(Modifier.height(16.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(12.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            "Handover OTP",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = order.otp!!,
+                            style = MaterialTheme.typography.headlineMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = PrimaryRed
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+
 
             AnimatedVisibility(visible = isExpanded) {
                 Column(modifier = Modifier.padding(top = 16.dp)) {
@@ -1218,27 +1326,53 @@ fun ProcessedOrderCard(order: Order, onEndOrder: () -> Unit, onAbortOrder: () ->
                     OrderDetailRow(icon = Icons.Default.Store, label = "Pickup", value = order.pickupAddress)
                     OrderDetailRow(icon = Icons.Default.Home, label = "Delivery", value = order.deliveryAddress)
                     OrderDetailRow(icon = Icons.Default.ShoppingBag, label = "Items", value = "${order.itemCount} Items")
+
                     Divider(modifier = Modifier.padding(vertical = 12.dp), color = LocalContentColor.current.copy(alpha = 0.3f))
                     OrderDetailRow(icon = Icons.Default.Receipt, label = "Order Total", value = "₹%.2f".format(order.totalAmount))
                     OrderDetailRow(icon = Icons.Default.TwoWheeler, label = "Delivery Charge", value = "₹%.2f".format(order.deliveryCharge))
                     OrderDetailRow(icon = Icons.Default.FlashOn, label = "Surge Charge", value = "₹%.2f".format(order.surgeCharge))
                     OrderDetailRow(icon = Icons.Default.Payments, label = "Amount to Collect", value = "₹%.2f".format(order.cashToCollect), isHighlight = true)
-                    Divider(modifier = Modifier.padding(vertical = 12.dp), color = LocalContentColor.current.copy(alpha = 0.3f))
+
                     if (order.tipAmount > 0) {
+                        Divider(modifier = Modifier.padding(vertical = 12.dp), color = LocalContentColor.current.copy(alpha = 0.3f))
                         OrderDetailRow(icon = Icons.Default.Favorite, label = "Tip Received", value = "₹%.2f".format(order.tipAmount))
                     }
                 }
             }
-
-            if (statusEnum == OrderStatus.ACCEPTED) {
-                Spacer(Modifier.height(16.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Spacer(Modifier.height(16.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (statusEnum != OrderStatus.COMPLETED && statusEnum != OrderStatus.REJECTED) {
                     Button(onClick = onAbortOrder, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.errorContainer)) { Text("Abort Order") }
-                    Button(onClick = onEndOrder, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary)) { Text("End Order") }
+                }
+
+                if (statusEnum == OrderStatus.OUT_FOR_DELIVERY) {
+                    Button(onClick = onEndOrder, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = GreenAccept)) { Text("Complete Order") }
                 }
             }
         }
     }
+}
+
+@Composable
+fun OtpDisplayDialog(otp: String, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Handover OTP") },
+        text = {
+            Text(
+                text = otp,
+                style = MaterialTheme.typography.headlineLarge,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center
+            )
+        },
+        confirmButton = {
+            Button(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
+    )
 }
 
 @Composable
@@ -1285,14 +1419,23 @@ fun OrderDetailRow(icon: ImageVector, label: String, value: String, isHighlight:
 @Composable
 fun OrderStatusChip(status: OrderStatus) {
     val (text, bgColor) = when (status) {
-        OrderStatus.ACCEPTED -> "Accepted" to DarkGray
+        OrderStatus.ACCEPTED_BY_RIDER -> "Accepted" to OrangeAccepted
         OrderStatus.REJECTED -> "Aborted" to PrimaryRed
         OrderStatus.COMPLETED -> "Completed" to DarkGray
+        OrderStatus.OUT_FOR_DELIVERY -> "In Transit" to BlueVerified
+        // FIX: Add this case to handle the READY status
+        OrderStatus.READY -> "Ready" to BlueVerified
         else -> status.name to LightGray
     }
-    Text(text = text, color = Color.White, modifier = Modifier.background(bgColor, RoundedCornerShape(50)).padding(horizontal = 12.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium)
+    Text(
+        text = text,
+        color = if (bgColor == OrangeAccepted) DarkGray else Color.White,
+        modifier = Modifier
+            .background(bgColor, RoundedCornerShape(50))
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+        style = MaterialTheme.typography.labelMedium
+    )
 }
-
 
 @Composable
 fun HomeTopBar(profile: RiderProfile, onStatusChangeClick: () -> Unit, onProfileClick: () -> Unit) {
@@ -1401,7 +1544,6 @@ fun ProfileScreen(navController: NavController, viewModel: RiderViewModel) {
             )
         }
     ) { padding ->
-        // --- ADDED a check for profile being null ---
         uiState.profile?.let { profile ->
             Column(
                 modifier = Modifier
@@ -1528,9 +1670,7 @@ class MainActivity : ComponentActivity() {
 
                     val uiState by riderViewModel.uiState.collectAsState()
 
-                    // --- THIS IS THE UPDATED LOGIC ---
                     LaunchedEffect(uiState.profile) {
-                        // Only start the service if the profile exists AND the rider is available
                         if (uiState.profile != null && uiState.profile!!.isAvailable) {
                             val riderId = SessionManager.getRiderId(applicationContext)
                             if (riderId != -1L && !isServiceBound) {
@@ -1541,7 +1681,6 @@ class MainActivity : ComponentActivity() {
                                 bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
                             }
                         } else {
-                            // If the rider is offline, make sure the service is stopped.
                             if (isServiceBound) {
                                 unbindService(serviceConnection)
                                 isServiceBound = false
