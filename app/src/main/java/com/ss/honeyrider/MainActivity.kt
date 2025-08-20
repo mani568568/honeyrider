@@ -394,41 +394,52 @@ class RiderViewModel(
     }
 
 
-    fun addNewOrderFromSocket(newOrder: Order) {
-        viewModelScope.launch {
-            // Check if this is an update to an order the rider has already accepted.
-            val existingProcessedIndex = allProcessedOrders.indexOfFirst { it.id == newOrder.id }
+    fun addNewOrderFromSocket(newOrder: Order) = viewModelScope.launch {
+        // Check if the order is already in the processed list.
+        val processedIndex = allProcessedOrders.indexOfFirst { it.id == newOrder.id }
+        if (processedIndex != -1) {
+            // This is an update to a processed order (e.g., READY -> OUT_FOR_DELIVERY)
+            val updatedOrder = allProcessedOrders[processedIndex].copy(
+                status = newOrder.status,
+                otp = newOrder.otp ?: allProcessedOrders[processedIndex].otp,
+                pickupTimestamp = if (newOrder.status.equals(OrderStatus.OUT_FOR_DELIVERY.name, true))
+                    System.currentTimeMillis()
+                else allProcessedOrders[processedIndex].pickupTimestamp
+            )
+            allProcessedOrders[processedIndex] = updatedOrder
+            filterProcessedOrders()
+            sendEvent(UiEvent.ShowToast("Order #${newOrder.id} status updated to ${newOrder.status.replace("_", " ")}"))
+            return@launch
+        }
 
-            if (existingProcessedIndex != -1) {
-                // If the order exists in the processed list, update its status.
-                val updatedOrder = allProcessedOrders[existingProcessedIndex].copy(
-                    status = newOrder.status,
-                    otp = newOrder.otp ?: allProcessedOrders[existingProcessedIndex].otp
+        // Check if the order is already in the pending list.
+        val pendingIndex = _uiState.value.pendingOrders.indexOfFirst { it.id == newOrder.id }
+        if (pendingIndex != -1) {
+            // This is an update to a pending order (e.g., ACCEPTED -> READY)
+            if (newOrder.status.equals(OrderStatus.READY.name, true)) {
+                val updatedOrder = _uiState.value.pendingOrders[pendingIndex].copy(
+                    status = newOrder.status
                 )
-                allProcessedOrders[existingProcessedIndex] = updatedOrder
-                filterProcessedOrders()
-                return@launch
+                _uiState.update { it.copy(
+                    pendingOrders = it.pendingOrders.toMutableList().also { list -> list[pendingIndex] = updatedOrder }
+                ) }
+                sendEvent(UiEvent.ShowToast("Order #${newOrder.id} is ready for pickup!"))
+            } else {
+                _uiState.update { it.copy(
+                    pendingOrders = it.pendingOrders.toMutableList().also { list -> list[pendingIndex] = newOrder }
+                ) }
             }
+            return@launch
+        }
 
-            // FIX: Handle the case where the order is no longer pending but not yet processed.
-            // This is a safety net for situations where the app re-connects after an event.
-            val isPending = _uiState.value.pendingOrders.any { it.id == newOrder.id }
-            if (isPending) {
-                // Remove the order from pending list and add it to processed.
-                _uiState.update { it.copy(pendingOrders = it.pendingOrders.filter { o -> o.id != newOrder.id }) }
-                allProcessedOrders.add(newOrder)
-                filterProcessedOrders()
-                sendEvent(UiEvent.ShowToast("Order #${newOrder.id} status updated to ${newOrder.status.replace("_", " ")}"))
-                return@launch
-            }
-
-            // If it's a new job offer, add it to the pending list.
-            if (newOrder.status.equals("ACCEPTED", ignoreCase = true) || newOrder.status.equals("READY", ignoreCase = true)) {
-                _uiState.update { it.copy(pendingOrders = it.pendingOrders + newOrder) }
-                sendEvent(UiEvent.ShowToast("New Order #${newOrder.id} is now available!"))
-            }
+        // If the order is not found in any list, treat it as a new job offer.
+        // This handles the initial broadcasting of orders.
+        if (newOrder.status.equals(OrderStatus.ACCEPTED.name, true) || newOrder.status.equals(OrderStatus.READY.name, true)) {
+            _uiState.update { it.copy(pendingOrders = it.pendingOrders + newOrder) }
+            sendEvent(UiEvent.ShowToast("New Order #${newOrder.id} is now available!"))
         }
     }
+
 
     fun toggleAvailability() {
         viewModelScope.launch {
