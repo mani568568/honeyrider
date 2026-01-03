@@ -1,7 +1,8 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
-    alias(libs.plugins.kotlin.compose) // <-- This is the new required plugin
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.google.services) // <-- Added for Firebase
 }
 
 android {
@@ -38,9 +39,8 @@ android {
         jvmTarget = "1.8"
     }
     buildFeatures {
-        compose = true // This still needs to be true
+        compose = true
     }
-    // The old 'composeOptions' block is no longer needed with the new plugin
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -58,18 +58,22 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
-    implementation(libs.androidx.material.icons.extended) // For all material icons
+    implementation(libs.androidx.material.icons.extended)
 
-    // --- Dependencies to fix the errors ---
+    implementation("com.squareup.retrofit2:converter-gson:2.9.0")
+
+    // Networking & Architecture
     implementation(libs.retrofit)
-    implementation(libs.retrofit.converter.gson)
     implementation(libs.okhttp)
     implementation(libs.gson)
     implementation(libs.coil.compose)
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
 
-
+    // --- Firebase / FCM ---
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.messaging)
+    implementation(libs.retrofit.converter.gson)
     // Testing
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
