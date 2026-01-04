@@ -100,7 +100,11 @@ import kotlin.math.abs
 // ================================================================================
 
 data class LoginRequest(val username: String, val password: String)
-data class LoginResponse(val token: String, val id: Long)
+
+data class LoginResponse(
+    val token: String,
+    @SerializedName("userId") val id: Long // Map appropriately
+)
 
 data class RiderProfile(
     val id: Long,
@@ -197,9 +201,9 @@ interface ApiService {
     @POST("/api/auth/login")
     suspend fun login(@Body request: LoginRequest): Response<LoginResponse>
 
-    // FIX: Changed to take ID path param, as Repository passes Long
-    @GET("/api/riders/{id}")
-    suspend fun getRiderProfile(@Path("id") id: Long): Response<RiderProfile>
+    // In ApiService interface inside MainActivity.kt
+    @GET("/api/riders/profile") // This usually extracts user from Token and finds the Rider
+    suspend fun getRiderProfile(): Response<RiderProfile>
 
     @POST("/api/riders/fcm-token")
     suspend fun updateFcmToken(@Body tokenMap: Map<String, String>): Response<Unit>
@@ -235,7 +239,7 @@ interface ApiService {
 }
 
 object RetrofitClient {
-    private const val BASE_URL = "http://192.168.31.242:8080/"
+    private const val BASE_URL = "http://192.168.31.243:8080/"
 
     fun getInstance(context: Context): ApiService {
         val authInterceptor = Interceptor { chain ->
@@ -276,13 +280,15 @@ class AuthRepository(private val apiService: ApiService) {
 }
 
 class RiderRepository(private val apiService: ApiService) {
-    // FIX: Unwrapping Response to return RiderProfile directly
+
+    // In RiderRepository class inside MainActivity.kt
     suspend fun getProfile(riderId: Long): RiderProfile {
-        val response = apiService.getRiderProfile(riderId)
+        // IGNORE riderId if using /profile endpoint
+        val response = apiService.getRiderProfile()
         if (response.isSuccessful && response.body() != null) {
             return response.body()!!
         } else {
-            throw Exception("Failed to fetch profile")
+            throw Exception("Failed to fetch profile: ${response.code()}")
         }
     }
 
@@ -331,6 +337,7 @@ enum class ProcessedOrderFilter { ALL, ACCEPTED, COMPLETED, REJECTED }
 sealed class UiEvent {
     data class ShowToast(val message: String) : UiEvent()
     object NavigateToHome : UiEvent()
+    object NavigateToLogin : UiEvent() // <--- Add this
 }
 
 class RiderViewModel(
@@ -379,14 +386,22 @@ class RiderViewModel(
     private fun fetchProfile(riderId: Long) {
         viewModelScope.launch {
             try {
+                // Add a small delay if needed for UI stability
+                // delay(100)
                 val profile = repository.getProfile(riderId)
                 _uiState.update { it.copy(profile = profile, isLoading = false) }
                 if (profile.isAvailable) {
                     syncRiderState(riderId)
                 }
             } catch (e: Exception) {
-                sendEvent(UiEvent.ShowToast("Failed to load profile"))
-                _uiState.update { it.copy(isLoading = false) }
+                Log.e("RiderViewModel", "Error fetching profile", e)
+
+                // --- FIX: HANDLE EXPIRED SESSION ---
+                // If profile fetch fails, assume token is invalid/expired.
+                // Clear session and force logout so user can re-login.
+                logout()
+                sendEvent(UiEvent.ShowToast("Session expired. Please login again."))
+                sendEvent(UiEvent.NavigateToLogin) // Ensure you have this event
             }
         }
     }
@@ -744,7 +759,7 @@ class OrderSocketService : Service() {
 
     private fun connect() {
         val request = Request.Builder()
-            .url("ws://192.168.31.242:8080/ws/orders?riderId=$riderId")
+            .url("ws://192.168.31.243:8080/ws/orders?riderId=$riderId")
             .build()
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
@@ -819,19 +834,32 @@ class OrderSocketService : Service() {
     }
 }
 
+
+// ... inside MainScreen ...
+
 @Composable
 fun MainScreen(riderViewModel: RiderViewModel) {
     val uiState by riderViewModel.uiState.collectAsState()
     val navController = rememberNavController()
 
-    LaunchedEffect(key1 = uiState.profile, key2 = uiState.isLoading) {
-        if (!uiState.isLoading) {
-            val route = if (uiState.profile != null) AppRoutes.HOME else AppRoutes.LOGIN
-            navController.navigate(route) {
-                popUpTo(0) { inclusive = true }
+    LaunchedEffect(Unit) {
+        riderViewModel.uiEvent.collect { event ->
+            when (event) {
+                is UiEvent.NavigateToHome -> {
+                    navController.navigate(AppRoutes.HOME) { popUpTo(AppRoutes.LOGIN) { inclusive = true } }
+                }
+                is UiEvent.NavigateToLogin -> { // <--- Handle Logout
+                    navController.navigate(AppRoutes.LOGIN) { popUpTo(0) { inclusive = true } }
+                }
+                is UiEvent.ShowToast -> {
+                    Toast.makeText(navController.context, event.message, Toast.LENGTH_SHORT).show()
+                }
             }
         }
     }
+
+    // Remove the old LaunchedEffect(key1 = uiState.profile) block that auto-navigated
+    // Rely strictly on the explicit event sent by the ViewModel upon successful login.
 
     if (uiState.isLoading) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -1418,13 +1446,15 @@ fun HomeTopBar(profile: RiderProfile, onStatusChangeClick: () -> Unit, onProfile
     ) {
         Column(modifier = Modifier.weight(1f, fill = false)) {
             Text(
-                text = profile.name,
+                // ✅ FIX: Safe call with Elvis operator
+                text = profile.name ?: "Unknown Rider",
                 style = MaterialTheme.typography.titleLarge,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
             Text(
-                text = profile.vehicleNumber,
+                // ✅ FIX: Safe call
+                text = profile.vehicleNumber ?: "No Vehicle",
                 style = MaterialTheme.typography.bodyMedium,
                 color = LightGray
             )
@@ -1527,11 +1557,11 @@ fun ProfileScreen(navController: NavController, viewModel: RiderViewModel) {
                 AsyncImage(model = profile.imageUrl, contentDescription = "Profile Picture", modifier = Modifier
                     .size(120.dp)
                     .clip(CircleShape), contentScale = ContentScale.Crop, placeholder = placeholderPainter, error = placeholderPainter)
-                Text(profile.name, style = MaterialTheme.typography.headlineSmall)
-                Text("@${profile.username}", style = MaterialTheme.typography.titleMedium, color = Color.Gray)
+                Text(profile.name ?: "Rider", style = MaterialTheme.typography.headlineSmall)
+                Text("@${profile.username ?: ""}", style = MaterialTheme.typography.titleMedium, color = Color.Gray)
                 HorizontalDivider()
-                ProfileInfoRow(icon = Icons.Default.TwoWheeler, label = "Vehicle Model", value = profile.vehicleModel)
-                ProfileInfoRow(icon = Icons.Default.ConfirmationNumber, label = "Vehicle Number", value = profile.vehicleNumber)
+                ProfileInfoRow(icon = Icons.Default.TwoWheeler, label = "Vehicle Model", value = profile.vehicleModel ?: "-")
+                ProfileInfoRow(icon = Icons.Default.ConfirmationNumber, label = "Vehicle Number", value = profile.vehicleNumber ?: "-")
                 Spacer(Modifier.weight(1f))
                 Button(onClick = {
                     viewModel.logout()
