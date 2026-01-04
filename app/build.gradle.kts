@@ -61,7 +61,7 @@ dependencies {
     implementation(libs.androidx.material.icons.extended)
 
     implementation("com.squareup.retrofit2:converter-gson:2.9.0")
-
+    implementation("com.google.android.gms:play-services-location:21.2.0")
     // Networking & Architecture
     implementation(libs.retrofit)
     implementation(libs.okhttp)

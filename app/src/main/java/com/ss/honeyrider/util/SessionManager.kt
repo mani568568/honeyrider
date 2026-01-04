@@ -2,6 +2,10 @@ package com.ss.honeyrider.util
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import com.ss.honeyrider.Order
+import com.ss.honeyrider.RiderProfile
 
 object SessionManager {
     private const val PREF_NAME = "HoneyRiderPrefs"
@@ -11,6 +15,21 @@ object SessionManager {
     private const val KEY_AUTH_TOKEN = "auth_token"
     private const val DEFAULT_RIDER_ID = -1L
     private const val KEY_FCM_TOKEN = "fcm_token"
+    private const val KEY_CACHED_PROFILE = "cached_profile"
+    private const val KEY_CACHED_PENDING_ORDERS = "cached_pending_orders"
+    private val gson = Gson()
+
+    fun saveRiderProfile(context: Context, profile: RiderProfile) {
+        val json = gson.toJson(profile)
+        getPrefs(context).edit().putString(KEY_CACHED_PROFILE, json).apply()
+    }
+
+    fun getRiderProfile(context: Context): RiderProfile? {
+        val json = getPrefs(context).getString(KEY_CACHED_PROFILE, null) ?: return null
+        return try {
+            gson.fromJson(json, RiderProfile::class.java)
+        } catch (e: Exception) { null }
+    }
 
     fun saveSession(context: Context, token: String, riderId: Long) {
         val editor = getPrefs(context).edit()
@@ -50,5 +69,19 @@ object SessionManager {
 
     fun clearSession(context: Context) {
         getPrefs(context).edit().clear().apply()
+    }
+
+    fun savePendingOrders(context: Context, orders: List<Order>) {
+        val json = gson.toJson(orders)
+        getPrefs(context).edit().putString(KEY_CACHED_PENDING_ORDERS, json).apply()
+    }
+
+    // ✅ GET ORDERS (Local DB Read)
+    fun getPendingOrders(context: Context): List<Order> {
+        val json = getPrefs(context).getString(KEY_CACHED_PENDING_ORDERS, null) ?: return emptyList()
+        val type = object : TypeToken<List<Order>>() {}.type
+        return try {
+            gson.fromJson(json, type)
+        } catch (e: Exception) { emptyList() }
     }
 }
