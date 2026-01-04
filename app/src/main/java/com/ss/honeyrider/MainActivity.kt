@@ -308,7 +308,7 @@ class RiderRepository(private val apiService: ApiService) {
     } catch (e: Exception) { Result.failure(e) }
 
     suspend fun updateStatus(riderId: Long, isAvailable: Boolean): Response<Unit> =
-        apiService.updateRiderStatus(riderId, mapOf("available" to isAvailable))
+        apiService.updateRiderStatus(riderId, mapOf("isAvailable" to isAvailable))
 
     suspend fun acceptOrder(orderId: Long) = apiService.acceptOrderByRider(orderId)
     suspend fun verifyOtp(orderId: Long, otp: String) = apiService.verifyOtp(orderId, mapOf("otp" to otp))
