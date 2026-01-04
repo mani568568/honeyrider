@@ -3,8 +3,8 @@ package com.ss.honeyrider.service
 import android.util.Log
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
-import com.ss.honeyrider.SessionManager // Import from root package
-import com.ss.honeyrider.RetrofitClient // Import from root package
+import com.ss.honeyrider.RetrofitClient
+import com.ss.honeyrider.util.SessionManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -13,20 +13,26 @@ class RiderFirebaseMessagingService : FirebaseMessagingService() {
 
     override fun onNewToken(token: String) {
         super.onNewToken(token)
-        Log.d("FCM", "New Token: $token")
+        Log.d("FCM", "🔄 New FCM Token generated: $token")
 
-        // Save locally
-        SessionManager.saveAuthToken(applicationContext, token) // Or save specific FCM token if needed
+        // 1. Save locally
+        SessionManager.saveFcmToken(applicationContext, token)
 
-        // Send to server
+        // 2. Check if user is logged in
         val authToken = SessionManager.getAuthToken(applicationContext)
-        if (authToken != null) {
+        if (!authToken.isNullOrEmpty()) {
+            // 3. Sync with server immediately
             CoroutineScope(Dispatchers.IO).launch {
                 try {
                     val api = RetrofitClient.getInstance(applicationContext)
-                    api.updateFcmToken(mapOf("token" to token))
+                    val response = api.updateFcmToken(mapOf("token" to token))
+                    if (response.isSuccessful) {
+                        Log.d("FCM", "✅ Token updated on server")
+                    } else {
+                        Log.e("FCM", "❌ Failed to update token on server: ${response.code()}")
+                    }
                 } catch (e: Exception) {
-                    Log.e("FCM", "Failed to sync token", e)
+                    Log.e("FCM", "❌ Network error updating token", e)
                 }
             }
         }

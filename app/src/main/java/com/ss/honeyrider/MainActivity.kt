@@ -68,8 +68,10 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import coil.compose.AsyncImage
+import com.google.firebase.messaging.FirebaseMessaging
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
+import com.ss.honeyrider.util.SessionManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -79,6 +81,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -161,36 +164,6 @@ enum class OrderStatus {
     OUT_FOR_DELIVERY
 }
 
-object SessionManager {
-    private const val PREFS_NAME = "RiderPrefs"
-    private const val KEY_RIDER_ID = "rider_id"
-    private const val KEY_AUTH_TOKEN = "auth_token"
-    private const val DEFAULT_RIDER_ID = -1L
-
-    private fun getPrefs(context: Context): SharedPreferences {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    }
-
-    fun saveAuthToken(context: Context, token: String) {
-        getPrefs(context).edit().putString(KEY_AUTH_TOKEN, token).apply()
-    }
-
-    fun getAuthToken(context: Context): String? {
-        return getPrefs(context).getString(KEY_AUTH_TOKEN, null)
-    }
-
-    fun saveRiderId(context: Context, riderId: Long) {
-        getPrefs(context).edit().putLong(KEY_RIDER_ID, riderId).apply()
-    }
-
-    fun getRiderId(context: Context): Long {
-        return getPrefs(context).getLong(KEY_RIDER_ID, DEFAULT_RIDER_ID)
-    }
-
-    fun clearSession(context: Context) {
-        getPrefs(context).edit().clear().apply()
-    }
-}
 
 data class RiderJobsResponse(
     val myAcceptedOrders: List<Order>,
@@ -208,9 +181,11 @@ interface ApiService {
     @POST("/api/riders/fcm-token")
     suspend fun updateFcmToken(@Body tokenMap: Map<String, String>): Response<Unit>
 
-    // FIX: Added missing endpoints referenced by Repository
-    @PUT("/api/riders/{id}/status")
-    suspend fun updateRiderStatus(@Path("id") id: Long, @Body status: Map<String, Boolean>): Response<Unit>
+    @PUT("/api/riders/{id}/availability")
+    suspend fun updateRiderStatus(
+        @Path("id") id: Long,
+        @Body status: Map<String, Boolean>
+    ): Response<Unit>
 
     @POST("/api/orders/{id}/accept")
     suspend fun acceptOrderByRider(@Path("id") id: Long): Response<Unit>
@@ -292,7 +267,24 @@ class RiderRepository(private val apiService: ApiService) {
         }
     }
 
-    suspend fun updateStatus(riderId: Long, isAvailable: Boolean) = apiService.updateRiderStatus(riderId, mapOf("isAvailable" to isAvailable))
+    suspend fun updateFcmToken(token: String): Result<Unit> {
+        return try {
+            val response = apiService.updateFcmToken(mapOf("token" to token))
+            if (response.isSuccessful) {
+                Result.success(Unit)
+            } else {
+                Result.failure(Exception("Failed to update FCM token"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun updateStatus(riderId: Long, isAvailable: Boolean): Response<Unit> {
+        // This sends JSON: {"isAvailable": true/false}
+        return apiService.updateRiderStatus(riderId, mapOf("available" to isAvailable))
+    }
+
     suspend fun acceptOrder(orderId: Long) = apiService.acceptOrderByRider(orderId)
     suspend fun verifyOtp(orderId: Long, otp: String) = apiService.verifyOtp(orderId, mapOf("otp" to otp))
     suspend fun completeOrder(orderId: Long, tip: Double) = apiService.completeOrderByRider(orderId, mapOf("tip" to tip))
@@ -367,15 +359,45 @@ class RiderViewModel(
         }
     }
 
+    private fun syncFcmToken() {
+        viewModelScope.launch {
+            try {
+                // Get token from Firebase (generates it if missing)
+                val token = FirebaseMessaging.getInstance().token.await()
+
+                // Save locally
+                SessionManager.saveFcmToken(getApplication(), token)
+                Log.d("RiderViewModel", "FCM Token retrieved: $token")
+
+                // Send to Server
+                repository.updateFcmToken(token)
+                Log.d("RiderViewModel", "FCM Token synced with server")
+
+            } catch (e: Exception) {
+                Log.e("RiderViewModel", "Failed to sync FCM token", e)
+            }
+        }
+    }
+
     fun onLoginClicked(username: String, password: String) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
+
+            // 1. Attempt Login
             val result = authRepository.login(LoginRequest(username, password))
+
             result.onSuccess { response ->
+                // 2. Save Session Data
                 SessionManager.saveAuthToken(getApplication(), response.token)
                 SessionManager.saveRiderId(getApplication(), response.id)
+
+                // 3. [NEW] Fetch & Sync FCM Token immediately
+                syncFcmToken()
+
+                // 4. Proceed to Home
                 fetchProfile(response.id)
                 sendEvent(UiEvent.NavigateToHome)
+
             }.onFailure {
                 sendEvent(UiEvent.ShowToast(it.message ?: "Login failed"))
                 _uiState.update { it.copy(isLoading = false) }
@@ -386,22 +408,26 @@ class RiderViewModel(
     private fun fetchProfile(riderId: Long) {
         viewModelScope.launch {
             try {
-                // Add a small delay if needed for UI stability
-                // delay(100)
+                // 1. Fetch Profile (This returns the correct Rider Data)
                 val profile = repository.getProfile(riderId)
+
+                // 2. Update UI State
                 _uiState.update { it.copy(profile = profile, isLoading = false) }
+
+                // ✅ FIX: SAVE THE REAL RIDER ID
+                // The 'profile.id' comes from the Rider table, which is what we need for updates.
+                SessionManager.saveRiderId(getApplication(), profile.id)
+                Log.d("RiderViewModel", "✅ Updated Session with Real Rider ID: ${profile.id}")
+
                 if (profile.isAvailable) {
-                    syncRiderState(riderId)
+                    // Now pass the CORRECT ID to sync state
+                    syncRiderState(profile.id)
                 }
             } catch (e: Exception) {
                 Log.e("RiderViewModel", "Error fetching profile", e)
-
-                // --- FIX: HANDLE EXPIRED SESSION ---
-                // If profile fetch fails, assume token is invalid/expired.
-                // Clear session and force logout so user can re-login.
                 logout()
                 sendEvent(UiEvent.ShowToast("Session expired. Please login again."))
-                sendEvent(UiEvent.NavigateToLogin) // Ensure you have this event
+                sendEvent(UiEvent.NavigateToLogin)
             }
         }
     }
