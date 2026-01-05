@@ -600,25 +600,55 @@ class RiderViewModel(
     fun acceptOrder(orderId: Long) {
         viewModelScope.launch {
             try {
+                // 1. Call Server API
                 val response = repository.acceptOrder(orderId)
+
                 if (response.isSuccessful) {
+                    // ✅ SUCCESS (200 OK): Logic to add to local DB
                     val acceptedOrder = _uiState.value.pendingOrders.find { it.id == orderId }
+
                     if (acceptedOrder != null) {
+                        val updatedOrder = acceptedOrder.copy(
+                            status = "ACCEPTED_BY_RIDER",
+                            acceptedTimestamp = System.currentTimeMillis()
+                        )
+
+                        // Update UI State
                         _uiState.update {
                             it.copy(
-                                pendingOrders = it.pendingOrders.filter { o -> o.id != orderId }
+                                pendingOrders = it.pendingOrders.filter { o -> o.id != orderId },
+                                // Add to processed list
                             )
                         }
-                        val updatedOrder = acceptedOrder.copy(status = "ACCEPTED_BY_RIDER", acceptedTimestamp = System.currentTimeMillis())
+
+                        // Add to Local List (In-Memory)
                         allProcessedOrders.add(updatedOrder)
                         filterProcessedOrders()
-                        sendEvent(UiEvent.ShowToast("Order Accepted! Proceed to vendor for pickup."))
+
+                        // **CRITICAL**: Save to Local Database (Session/Cache) ONLY HERE
+                        val currentPending = SessionManager.getPendingOrders(getApplication()).toMutableList()
+                        currentPending.removeIf { it.id == orderId }
+                        SessionManager.savePendingOrders(getApplication(), currentPending)
+
+                        // Optionally save "My Orders" to SessionManager if you cache those too
+
+                        sendEvent(UiEvent.ShowToast("Order Accepted! Proceed to vendor."))
                     }
+                } else if (response.code() == 409) {
+                    // ❌ FAILURE (409 Conflict): Order taken by someone else
+
+                    // Remove from pending list locally so they don't click again
+                    _uiState.update {
+                        it.copy(pendingOrders = it.pendingOrders.filter { o -> o.id != orderId })
+                    }
+
+                    sendEvent(UiEvent.ShowToast("Too late! Order already accepted by another rider."))
                 } else {
-                    sendEvent(UiEvent.ShowToast("Failed to accept order"))
+                    sendEvent(UiEvent.ShowToast("Failed to accept order: ${response.message()}"))
                 }
             } catch (e: Exception) {
-                sendEvent(UiEvent.ShowToast("Network error"))
+                Log.e("RiderViewModel", "Network error", e)
+                sendEvent(UiEvent.ShowToast("Network error. Check connection."))
             }
         }
     }
