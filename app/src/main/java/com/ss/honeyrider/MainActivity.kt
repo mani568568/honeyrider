@@ -133,9 +133,10 @@ data class LocationUpdateRequest(
 
 data class LoginResponse(
     val token: String,
-    @SerializedName("userId") val id: Long // Map appropriately
+    @SerializedName("userId") val id: Long
 )
 
+// ✅ UPDATED: Added status fields to match Backend DTO
 data class RiderProfile(
     val id: Long,
     val username: String,
@@ -143,7 +144,13 @@ data class RiderProfile(
     val vehicleModel: String,
     val vehicleNumber: String,
     val imageUrl: String?,
-    val isAvailable: Boolean
+    val isAvailable: Boolean,
+
+    @SerializedName("userStatus")
+    val userStatus: String? = "ACTIVE", // e.g., "ACTIVE", "SUSPENDED"
+
+    @SerializedName("availabilityStatus")
+    val availabilityStatus: String? = "OFFLINE" // e.g., "ONLINE", "OFFLINE"
 )
 
 @JvmInline
@@ -190,7 +197,6 @@ enum class OrderStatus {
     ACCEPTED_BY_RIDER,
     OUT_FOR_DELIVERY
 }
-
 
 data class RiderJobsResponse(
     val myAcceptedOrders: List<Order>,
@@ -295,11 +301,9 @@ class RiderRepository(private val apiService: ApiService) {
         if (response.isSuccessful && response.body() != null) {
             return response.body()!!
         } else {
-            // Throwing exception here with code allows handling 401 specifically
             throw HttpException(response.code(), "Failed to fetch profile")
         }
     }
-    // Custom exception for cleaner handling
     class HttpException(val code: Int, message: String) : Exception(message)
 
     suspend fun updateFcmToken(token: String): Result<Unit> = try {
@@ -349,7 +353,7 @@ enum class ProcessedOrderFilter { ALL, ACCEPTED, COMPLETED, REJECTED }
 sealed class UiEvent {
     data class ShowToast(val message: String) : UiEvent()
     object NavigateToHome : UiEvent()
-    object NavigateToLogin : UiEvent() // <--- Add this
+    object NavigateToLogin : UiEvent()
 }
 
 class RiderViewModel(
@@ -403,7 +407,6 @@ class RiderViewModel(
     private fun checkIfLoggedIn() {
         val riderId = SessionManager.getRiderId(getApplication())
         if (riderId != -1L) {
-            // ✅ 1. LOAD FROM LOCAL DB IMMEDIATELY (Offline Support)
             val cachedProfile = SessionManager.getRiderProfile(getApplication())
             val cachedOrders = SessionManager.getPendingOrders(getApplication())
 
@@ -411,8 +414,6 @@ class RiderViewModel(
                 Log.d("RiderViewModel", "Loaded Profile from Local DB")
                 _uiState.update { it.copy(profile = cachedProfile, pendingOrders = cachedOrders, isLoading = false) }
             }
-
-            // ✅ 2. ATTEMPT NETWORK FETCH
             fetchProfile(riderId)
         } else {
             _uiState.update { it.copy(isLoading = false) }
@@ -422,17 +423,9 @@ class RiderViewModel(
     private fun syncFcmToken() {
         viewModelScope.launch {
             try {
-                // Get token from Firebase (generates it if missing)
                 val token = FirebaseMessaging.getInstance().token.await()
-
-                // Save locally
                 SessionManager.saveFcmToken(getApplication(), token)
-                Log.d("RiderViewModel", "FCM Token retrieved: $token")
-
-                // Send to Server
                 repository.updateFcmToken(token)
-                Log.d("RiderViewModel", "FCM Token synced with server")
-
             } catch (e: Exception) {
                 Log.e("RiderViewModel", "Failed to sync FCM token", e)
             }
@@ -459,14 +452,23 @@ class RiderViewModel(
     private fun fetchProfile(riderId: Long) {
         viewModelScope.launch {
             try {
-                // Fetch fresh data
                 val profile = repository.getProfile(riderId)
 
-                // ✅ Update UI & Save to Local DB
+                // ✅ UPDATED: Account Status Check
+                // If user is suspended, force logout
+                if (profile.userStatus != null &&
+                    (profile.userStatus == "SUSPENDED" || profile.userStatus == "INACTIVE")) {
+
+                    sendEvent(UiEvent.ShowToast("Account Suspended. Contact Admin."))
+                    logout()
+                    sendEvent(UiEvent.NavigateToLogin)
+                    return@launch
+                }
+
                 _uiState.update { it.copy(profile = profile, isLoading = false) }
 
                 SessionManager.saveRiderId(getApplication(), profile.id)
-                SessionManager.saveRiderProfile(getApplication(), profile) // <--- PERSIST PROFILE
+                SessionManager.saveRiderProfile(getApplication(), profile)
                 Log.d("RiderViewModel", "Saved Profile to Local DB")
 
                 if (profile.isAvailable) {
@@ -474,20 +476,16 @@ class RiderViewModel(
                 }
             } catch (e: Exception) {
                 Log.e("RiderViewModel", "Error fetching profile", e)
-
-                // ✅ CRITICAL FIX: DO NOT LOGOUT ON NETWORK ERROR
                 val isAuthError = (e is RiderRepository.HttpException && e.code == 401)
 
                 if (isAuthError) {
-                    logout() // Only logout if token is invalid
+                    logout()
                     sendEvent(UiEvent.ShowToast("Session expired. Please login again."))
                     sendEvent(UiEvent.NavigateToLogin)
                 } else {
-                    // It's a network error, check if we have cache
                     if (_uiState.value.profile != null) {
                         sendEvent(UiEvent.ShowToast("Offline Mode: Unable to sync"))
                     } else {
-                        // Retry?
                         sendEvent(UiEvent.ShowToast("Network Error. Please check connection."))
                     }
                     _uiState.update { it.copy(isLoading = false) }
@@ -497,6 +495,7 @@ class RiderViewModel(
     }
 
     fun addNewOrderFromSocket(newOrder: Order) = viewModelScope.launch {
+        // ... (Existing implementation remains same)
         val processedIndex = allProcessedOrders.indexOfFirst { it.id == newOrder.id }
         if (processedIndex != -1) {
             val updatedOrder = allProcessedOrders[processedIndex].copy(
@@ -549,11 +548,14 @@ class RiderViewModel(
                 if(location!=null) repository.updateLocation(riderId, location.latitude, location.longitude)
             }
             try {
+                // Backend automatically updates AvailabilityStatus enum based on this boolean
                 val response = repository.updateStatus(riderId, newAvailability)
                 if (response.isSuccessful) {
-                    val updatedProfile = currentProfile.copy(isAvailable = newAvailability)
+                    val updatedProfile = currentProfile.copy(
+                        isAvailable = newAvailability,
+                        availabilityStatus = if(newAvailability) "ONLINE" else "OFFLINE" // Optimistic update
+                    )
                     _uiState.update { it.copy(profile = updatedProfile) }
-                    // Update Local DB
                     SessionManager.saveRiderProfile(getApplication(), updatedProfile)
                     if (newAvailability) syncRiderState(riderId)
                 } else sendEvent(UiEvent.ShowToast("Failed to update status"))
@@ -576,18 +578,10 @@ class RiderViewModel(
                 val response = repository.getRiderJobs(riderId)
                 if (response.isSuccessful) {
                     response.body()?.let { jobs ->
-                        // Filter out duplicates
                         val currentIds = _uiState.value.pendingOrders.map { o -> o.id }.toSet()
                         val newOrders = jobs.availableJobs.filter { o -> !currentIds.contains(o.id) }
-
                         val updatedPending = _uiState.value.pendingOrders + newOrders
-
-                        // ✅ 1. UPDATE UI STATE (Must return RiderUiState inside the brackets)
-                        _uiState.update {
-                            it.copy(pendingOrders = updatedPending)
-                        } // <--- CLOSE BRACKET HERE
-
-                        // ✅ 2. SAVE TO LOCAL DB (Call this OUTSIDE the update block)
+                        _uiState.update { it.copy(pendingOrders = updatedPending) }
                         SessionManager.savePendingOrders(getApplication(), updatedPending)
                     }
                 }
@@ -600,48 +594,26 @@ class RiderViewModel(
     fun acceptOrder(orderId: Long) {
         viewModelScope.launch {
             try {
-                // 1. Call Server API
                 val response = repository.acceptOrder(orderId)
-
                 if (response.isSuccessful) {
-                    // ✅ SUCCESS (200 OK): Logic to add to local DB
                     val acceptedOrder = _uiState.value.pendingOrders.find { it.id == orderId }
-
                     if (acceptedOrder != null) {
                         val updatedOrder = acceptedOrder.copy(
                             status = "ACCEPTED_BY_RIDER",
                             acceptedTimestamp = System.currentTimeMillis()
                         )
-
-                        // Update UI State
                         _uiState.update {
-                            it.copy(
-                                pendingOrders = it.pendingOrders.filter { o -> o.id != orderId },
-                                // Add to processed list
-                            )
+                            it.copy(pendingOrders = it.pendingOrders.filter { o -> o.id != orderId })
                         }
-
-                        // Add to Local List (In-Memory)
                         allProcessedOrders.add(updatedOrder)
                         filterProcessedOrders()
-
-                        // **CRITICAL**: Save to Local Database (Session/Cache) ONLY HERE
                         val currentPending = SessionManager.getPendingOrders(getApplication()).toMutableList()
                         currentPending.removeIf { it.id == orderId }
                         SessionManager.savePendingOrders(getApplication(), currentPending)
-
-                        // Optionally save "My Orders" to SessionManager if you cache those too
-
                         sendEvent(UiEvent.ShowToast("Order Accepted! Proceed to vendor."))
                     }
                 } else if (response.code() == 409) {
-                    // ❌ FAILURE (409 Conflict): Order taken by someone else
-
-                    // Remove from pending list locally so they don't click again
-                    _uiState.update {
-                        it.copy(pendingOrders = it.pendingOrders.filter { o -> o.id != orderId })
-                    }
-
+                    _uiState.update { it.copy(pendingOrders = it.pendingOrders.filter { o -> o.id != orderId }) }
                     sendEvent(UiEvent.ShowToast("Too late! Order already accepted by another rider."))
                 } else {
                     sendEvent(UiEvent.ShowToast("Failed to accept order: ${response.message()}"))
@@ -963,6 +935,12 @@ class OrderSocketService : Service() {
     }
 }
 
+// ... (Rest of UI Composable functions like MainScreen, AppScaffold, etc. remain unchanged) ...
+// The changes in data classes and ViewModel will propagate automatically to the existing UI.
+// Include all existing composables (MainScreen, AppScaffold, AppNavigation, AppBottomNavigation, LoginScreen, HomeScreen, OrdersScreen, etc.)
+// from the original file here to ensure the full file is valid.
+// For brevity in this response window, assume the UI code below this point is identical to the provided file unless specified.
+
 @Composable
 fun MainScreen(riderViewModel: RiderViewModel) {
     val uiState by riderViewModel.uiState.collectAsState()
@@ -984,24 +962,23 @@ fun MainScreen(riderViewModel: RiderViewModel) {
         }
     }
 
-    // Remove the old LaunchedEffect(key1 = uiState.profile) block that auto-navigated
-    // Rely strictly on the explicit event sent by the ViewModel upon successful login.
-
     if (uiState.isLoading) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             CircularProgressIndicator()
         }
     } else {
-        // ✅ FIXED: Determine Start Destination
         val startDestination = if (uiState.profile != null) AppRoutes.HOME else AppRoutes.LOGIN
         AppScaffold(
             navController = navController,
             riderViewModel = riderViewModel,
-            startDestination = startDestination // ✅ Pass it
+            startDestination = startDestination
         )
     }
 }
 
+// ... (Include AppScaffold, AppNavigation, AppBottomNavigation, LoginScreen, HomeScreen, etc. exactly as provided in input) ...
+// ...
+// ...
 @Composable
 fun AppScaffold(
     navController: NavHostController,
@@ -1151,21 +1128,18 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
     val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
 
-    // ✅ ADDED: Permission Launcher for Location Click
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
             permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
         ) {
-            // If permission granted after click, show location
             viewModel.showCurrentLocationAddress()
         } else {
             Toast.makeText(context, "Location permission needed.", Toast.LENGTH_SHORT).show()
         }
     }
 
-    // Existing launcher for Status Toggle (Keep this or merge logic if preferred)
     val statusPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -1203,8 +1177,6 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
                         }
                     },
                     onProfileClick = { navController.navigate(AppRoutes.PROFILE) },
-
-                    // ✅ ADDED: Location Click Logic
                     onLocationClick = {
                         if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
                             locationPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
@@ -1251,7 +1223,6 @@ fun HomeScreen(navController: NavController, viewModel: RiderViewModel) {
         }
     }
 }
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OrdersScreen(viewModel: RiderViewModel) {
@@ -1636,7 +1607,7 @@ fun HomeTopBar(
     profile: RiderProfile,
     onStatusChangeClick: () -> Unit,
     onProfileClick: () -> Unit,
-    onLocationClick: () -> Unit // ✅ ADDED Parameter
+    onLocationClick: () -> Unit
 ) {
     Row(
         modifier = Modifier
